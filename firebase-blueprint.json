@@ -1,0 +1,111 @@
+{
+  "entities": {
+    "Chef": {
+      "title": "Chef",
+      "description": "A contestant in Top Chef",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "hometown": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "eliminated", "lck"] },
+        "totalScore": { "type": "number" },
+        "imageUrl": { "type": "string" }
+      },
+      "required": ["name", "status", "totalScore"]
+    },
+    "Player": {
+      "title": "Player",
+      "description": "A fantasy league participant",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "displayName": { "type": "string" },
+        "draftOrder": { "type": "integer" },
+        "chefIds": { "type": "array", "items": { "type": "string" } },
+        "totalScore": { "type": "number" },
+        "photoURL": { "type": "string" }
+      },
+      "required": ["name", "draftOrder", "chefIds", "totalScore"]
+    },
+    "ScoreEvent": {
+      "title": "ScoreEvent",
+      "description": "A scoring event for a chef",
+      "type": "object",
+      "properties": {
+        "chefId": { "type": "string" },
+        "week": { "type": "integer" },
+        "type": { "type": "string" },
+        "points": { "type": "number" },
+        "description": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["chefId", "week", "type", "points", "timestamp"]
+    },
+    "LeagueConfig": {
+      "title": "LeagueConfig",
+      "description": "Global league configuration",
+      "type": "object",
+      "properties": {
+        "draftStarted": { "type": "boolean" },
+        "draftCompleted": { "type": "boolean" },
+        "currentDraftTurn": { "type": "integer" },
+        "draftOrder": { "type": "array", "items": { "type": "string" } },
+        "rankingsOpen": { "type": "boolean" },
+        "rankingWeight": { "type": "number", "description": "Weight of ranking accuracy in total score (0-1)" }
+      },
+      "required": ["draftStarted", "draftCompleted"]
+    },
+    "PlayerStatus": {
+      "title": "PlayerStatus",
+      "description": "A status update or thought from a team owner",
+      "type": "object",
+      "properties": {
+        "playerId": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "text": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["playerId", "userId", "text", "timestamp"]
+    },
+    "Poll": {
+      "title": "Poll",
+      "description": "A poll for users to vote on",
+      "type": "object",
+      "properties": {
+        "question": { "type": "string" },
+        "options": { "type": "array", "items": { "type": "string" } },
+        "votes": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["question", "options", "votes", "active", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/chefs/{chefId}": {
+      "schema": "Chef",
+      "description": "Collection of chefs"
+    },
+    "/players/{playerId}": {
+      "schema": "Player",
+      "description": "Collection of players"
+    },
+    "/scoreEvents/{eventId}": {
+      "schema": "ScoreEvent",
+      "description": "Collection of scoring events"
+    },
+    "/playerStatuses/{statusId}": {
+      "schema": "PlayerStatus",
+      "description": "Collection of player status updates"
+    },
+    "/polls/{pollId}": {
+      "schema": "Poll",
+      "description": "Collection of polls"
+    },
+    "/config/league": {
+      "schema": "LeagueConfig",
+      "description": "League configuration document"
+    }
+  }
+}
