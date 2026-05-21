@@ -45,6 +45,7 @@ import {
   ArrowDown,
   Zap,
   AlertCircle,
+  AlertTriangle,
   GripVertical,
   BarChart3,
   Info,
@@ -57,6 +58,14 @@ import {
   CheckCircle2,
   Table as TableIcon,
   Send,
+  ChevronDown,
+  ChevronUp,
+  Save,
+  Layout,
+  ArrowRightLeft,
+  Settings,
+  Layers,
+  Filter,
   Lock,
   ArrowRight,
   Shield,
@@ -64,7 +73,9 @@ import {
   PieChart,
   ChevronRight,
   Globe,
-  Link
+  Link,
+  HelpCircle,
+  Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -222,6 +233,8 @@ interface LeagueConfig {
   rankingsOpen: boolean;
   rankingWeight?: number; // 0 to 1, default 0.5
   inviteCode?: string;
+  bonusScoresDisabled?: boolean;
+  scoringStartWeek?: number;
 }
 
 // --- Constants ---
@@ -460,28 +473,143 @@ function PollWidget({ poll, user }: { poll: Poll | null, user: User | null }) {
   );
 }
 
+// --- Accuracy Calculation ---
+export function calculatePlayerAccuracy(players: Player[], chefs: Chef[], config: LeagueConfig | null) {
+  if (chefs.length === 0 || players.length === 0) {
+    return { 
+      playersWithBonus: players.map(p => ({ ...p, rankingBonus: 0, displayScore: p.totalScore, accuracy: 0, avgDiff: 0, accuracyRank: 0 })), 
+      actualChefOrder: [] 
+    };
+  }
+
+  // Determine actual sequence of chefs by performance
+  const sortedChefs = [...chefs].sort((a, b) => {
+    if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
+    if (a.status === 'active' && b.status !== 'active') return -1;
+    if (b.status === 'active' && a.status !== 'active') return 1;
+    return a.name.localeCompare(b.name);
+  });
+  const actualChefOrder = sortedChefs.map(c => c.id);
+
+  // Assess RMSE for each player
+  const playerAccuracies = players.map(player => {
+    if (!player.rankings || player.rankings.length === 0) {
+      return { id: player.id, rawAccuracy: 0, avgDiff: 0 };
+    }
+    
+    // Fill in any missing chefs at the bottom. 
+    // IMPORTANT: Sort missing chefs alphabetically so they don't accidentally match the actualChefOrder and give free accuracy points.
+    const uniqueRankings = [...new Set(player.rankings || [])] as string[];
+    let playerValidRankings = uniqueRankings.filter(id => actualChefOrder.includes(id));
+    const missingChefs = actualChefOrder.filter(id => !playerValidRankings.includes(id)).sort((a, b) => a.localeCompare(b));
+    playerValidRankings = playerValidRankings.concat(missingChefs);
+    
+    let squaredDistance = 0;
+    playerValidRankings.forEach((chefId, index) => {
+      const actualIndex = actualChefOrder.indexOf(chefId);
+      if (actualIndex !== -1) {
+        squaredDistance += Math.pow(index - actualIndex, 2);
+      }
+    });
+
+    const n = actualChefOrder.length;
+    // Bell Curve Scoring Parameters
+    // A sigma of 4 gives a smooth, rewarding curve without punishing minor swaps too harshly
+    const sigma = 4; 
+    const avgDiff = n > 0 ? Math.sqrt(squaredDistance / n) : 0; // RMSE
+    
+    // Calculate raw accuracy
+    const rawAccuracy = n > 0 ? Math.exp(-(avgDiff * avgDiff) / (2 * sigma * sigma)) : 0;
+    
+    return { id: player.id, rawAccuracy, avgDiff };
+  });
+
+  const maxChefScore = Math.max(...chefs.map(c => c.totalScore), 0);
+  const validAccuracies = playerAccuracies.filter(p => (players.find(pl => pl.id === p.id)?.rankings?.length || 0) > 0);
+  const topRawAccuracy = validAccuracies.length > 0 ? Math.max(...validAccuracies.map(p => p.rawAccuracy)) : 0;
+
+  let playersWithBonus = players.map(player => {
+    const accInfo = playerAccuracies.find(a => a.id === player.id);
+    const rawAcc = accInfo?.rawAccuracy || 0;
+    const avgDiff = accInfo?.avgDiff || 0;
+    
+    // Normalize to top player
+    const hasRankings = player.rankings && player.rankings.length > 0;
+    const acc = topRawAccuracy > 0 && hasRankings ? (rawAcc / topRawAccuracy) : 0;
+    const originalRankingBonus = Math.round(maxChefScore * acc);
+    const rankingBonus = config?.bonusScoresDisabled ? 0 : originalRankingBonus;
+    const displayScore = player.totalScore + rankingBonus;
+
+    return { 
+      ...player, 
+      rankingBonus, 
+      displayScore, 
+      accuracy: acc,
+      avgDiff
+    };
+  });
+
+  // Assign accuracyRank based on avgDiff
+  const sortedByAvgDiff = [...playersWithBonus].sort((a, b) => {
+    if (a.avgDiff === 0 && b.avgDiff !== 0) return 1;
+    if (b.avgDiff === 0 && a.avgDiff !== 0) return -1;
+    return a.avgDiff - b.avgDiff;
+  });
+
+  playersWithBonus = playersWithBonus.map(player => {
+    const rankIndex = sortedByAvgDiff.findIndex(p => p.id === player.id);
+    const hasRankings = player.rankings && player.rankings.length > 0;
+    return {
+      ...player,
+      accuracyRank: hasRankings ? rankIndex + 1 : 0
+    };
+  });
+
+  return { playersWithBonus, actualChefOrder };
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [chefs, setChefs] = useState<Chef[]>([]);
+  const [rawChefs, setRawChefs] = useState<Chef[]>([]);
   const [rawPlayers, setRawPlayers] = useState<Player[]>([]);
+  const [events, setEvents] = useState<any[]>([]);
   const [comments, setComments] = useState<PlayerStatus[]>([]);
   const [activePoll, setActivePoll] = useState<Poll | null>(null);
   const [maxWeek, setMaxWeek] = useState<number>(0);
+  const [config, setConfig] = useState<LeagueConfig | null>(null);
 
   useEffect(() => {
-    const fetchMaxWeek = async () => {
-      try {
-        const q = query(collection(db, 'scoreEvents'), orderBy('week', 'desc'), limit(1));
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-          setMaxWeek(snap.docs[0].data().week);
-        }
-      } catch (error) {
-        console.error("Error fetching max week:", error);
+    const q = query(collection(db, 'scoreEvents'), orderBy('week', 'desc'), limit(1));
+    const unsubscribe = onSnapshot(q, (snap) => {
+      if (!snap.empty) {
+        setMaxWeek(snap.docs[0].data().week);
+      } else {
+        setMaxWeek(0);
       }
-    };
-    fetchMaxWeek();
+    }, (error) => {
+      console.error("Error listening to max week:", error);
+    });
+    return () => unsubscribe();
   }, []);
+
+  useEffect(() => {
+    const q = query(collection(db, 'scoreEvents'), orderBy('week', 'asc'));
+    const unsubscribe = onSnapshot(q, (snap) => {
+      setEvents(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      console.error("Error fetching all score events:", error);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const chefs = useMemo(() => {
+    const startWeek = config?.scoringStartWeek ?? 1;
+    return rawChefs.map(chef => {
+      const chefEvents = events.filter(e => e.chefId === chef.id && e.week >= startWeek);
+      const computedScore = chefEvents.reduce((sum, e) => sum + (e.points || 0), 0);
+      return { ...chef, totalScore: computedScore };
+    });
+  }, [rawChefs, events, config?.scoringStartWeek]);
 
   const players = useMemo(() => {
     return rawPlayers.map(player => {
@@ -516,17 +644,19 @@ export default function App() {
     });
     return () => unsubscribe();
   }, []);
-  const [config, setConfig] = useState<LeagueConfig | null>(null);
   const [activeTab, setActiveTab] = useState<'scoreboard' | 'rankings' | 'draft' | 'stats' | 'scoring' | 'admin'>('scoreboard');
   const [claimId, setClaimId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info', message: string } | null>(null);
+  const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info' | 'warning', message: string } | null>(null);
   const [proxyPlayerId, setProxyPlayerId] = useState('');
 
-  const showStatus = (type: 'success' | 'error' | 'info', message: string) => {
+  const statusTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const showStatus = (type: 'success' | 'error' | 'info' | 'warning', message: string) => {
+    if (statusTimeoutRef.current) clearTimeout(statusTimeoutRef.current);
     setStatus({ type, message });
-    setTimeout(() => setStatus(null), 5000);
+    statusTimeoutRef.current = setTimeout(() => setStatus(null), 8000);
   };
 
   const isAdmin = user?.email?.toLowerCase() === 'garrettlmiller@gmail.com';
@@ -545,10 +675,22 @@ export default function App() {
   useEffect(() => {
     async function testConnection() {
       try {
-        await getDocFromServer(doc(db, 'test', 'connection'));
-      } catch (error) {
-        if(error instanceof Error && error.message.includes('the client is offline')) {
-          console.error("Please check your Firebase configuration. The client is offline.");
+        // Try a standard getDoc first which can handle cache
+        console.log('Testing Firestore connection...');
+        await getDoc(doc(db, 'config', 'league'));
+        console.log('Firestore connection verified (standard).');
+      } catch (error: any) {
+        console.warn("Standard connection test failed, trying server-only test:", error.message);
+        try {
+          await getDocFromServer(doc(db, 'config', 'league'));
+          console.log('Firestore connection verified (server).');
+        } catch (serverError: any) {
+          if (serverError.message?.includes('offline') || serverError.message?.includes('reach')) {
+            console.error("CRITICAL: Firestore is unreachable. Status: Offline.");
+            showStatus('error', "Firebase Connection Error: The client appears to be offline or the backend is unreachable. Please check your internet or configuration.");
+          } else {
+            console.error("Firestore test failed with error:", serverError);
+          }
         }
       }
     }
@@ -583,7 +725,7 @@ export default function App() {
 
   useEffect(() => {
     const unsubChefs = onSnapshot(collection(db, 'chefs'), (snapshot) => {
-      setChefs(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Chef)));
+      setRawChefs(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Chef)));
     });
     const unsubPlayers = onSnapshot(collection(db, 'players'), (snapshot) => {
       setRawPlayers(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Player)));
@@ -622,17 +764,37 @@ export default function App() {
     try {
       console.log('Starting seed process...');
 
-      // 0. Clear existing data
-      const collectionsToClear = ['chefs', 'players', 'scoreEvents'];
-      for (const collName of collectionsToClear) {
+      // 0. Fetch existing config first to PROTECT the draft order at all costs
+      const configRef = doc(db, 'config', 'league');
+      const configSnap = await getDoc(configRef);
+      const existingDraftOrder = configSnap.exists() ? configSnap.data().draftOrder : [];
+
+      // 1. Clear score events and chefs, but PROTECT players (keep accounts)
+      const collsToClear = ['chefs', 'scoreEvents'];
+      for (const collName of collsToClear) {
         const snap = await getDocs(collection(db, collName));
         const deletePromises = snap.docs.map(d => deleteDoc(d.ref));
         await Promise.all(deletePromises);
       }
-      console.log('Existing data cleared.');
       
-      // 1. Seed Chefs
-      const initialChefs = [
+      // Update players instead of resetting them completely - PROTECT their existence
+      const playerSnap = await getDocs(collection(db, 'players'));
+      const currentPlayerIdsFromDb: string[] = [];
+      for (const playerDoc of playerSnap.docs) {
+        currentPlayerIdsFromDb.push(playerDoc.id);
+        const pData = playerDoc.data();
+        await updateDoc(playerDoc.ref, {
+          chefIds: [], // Clear for new season
+          totalScore: 0,
+          rankingBonus: 0,
+          // PROTECT: rankings: pData.rankings || [],
+          // We don't even include it in the update to be safe
+        });
+      }
+      console.log('Chefs cleared. Players reset (preserved accounts, rankings, and existing draft order).');
+      
+      // 2. Seed Chefs (Season 23 Carolinas)
+      const initialChefs: any[] = [
         { name: 'Sieger Bayer', hometown: 'Chicago, Illinois' },
         { name: 'Jaspratap "Jassi" Bindra', hometown: 'Houston, Texas' },
         { name: 'Sherry Cardoso', hometown: 'Brooklyn, New York' },
@@ -643,7 +805,6 @@ export default function App() {
         { name: 'Duyen Ha', hometown: 'Los Angeles, California' },
         { name: 'Jennifer Lee Jackson', hometown: 'Suttons Bay, Michigan' },
         { name: 'Anthony Jones', hometown: 'Alexandria, Virginia' },
-        { name: 'Day Anaïs Joseph', hometown: 'Atlanta, Georgia', status: 'eliminated' },
         { name: 'Laurence Louie', hometown: 'Quincy, Massachusetts' },
         { name: 'Rhoda Magbitang', hometown: 'Kailua-Kona, Hawaii' },
         { name: 'Justin Tootla', hometown: 'Suttons Bay, Michigan' },
@@ -663,41 +824,57 @@ export default function App() {
       await Promise.all(chefPromises);
       console.log('Chefs seeded.');
 
-      // 2. Seed Players
-      const shuffledPlayers = [...INITIAL_PLAYERS].sort(() => Math.random() - 0.5);
-      const playerIds: string[] = [];
+      // 3. Seed Missing Players (Don't overwrite existing)
+      const finalPlayerIds = [...currentPlayerIdsFromDb];
 
-      for (const name of shuffledPlayers) {
+      for (const name of INITIAL_PLAYERS) {
         try {
-          // If the name is "Garrett" and the current user is the admin, use their UID
-          const isMe = name === 'Garrett' && auth.currentUser?.email?.toLowerCase() === 'garrettlmiller@gmail.com';
-          const docId = isMe ? auth.currentUser!.uid : undefined;
+          const isMe = (name === 'Garrett' || name.includes('Garrett')) && 
+                       auth.currentUser?.email?.toLowerCase() === 'garrettlmiller@gmail.com';
           
-          const playerRef = docId ? doc(db, 'players', docId) : doc(collection(db, 'players'));
-          
-          await setDoc(playerRef, {
-            name,
-            draftOrder: playerIds.length,
-            chefIds: [],
-            totalScore: 0,
-            email: isMe ? auth.currentUser!.email : null
-          });
-          playerIds.push(playerRef.id);
+          if (isMe && auth.currentUser) {
+            const playerRef = doc(db, 'players', auth.currentUser.uid);
+            const pSnap = await getDoc(playerRef);
+            if (!pSnap.exists()) {
+              await setDoc(playerRef, {
+                name: auth.currentUser.displayName || name,
+                email: auth.currentUser.email,
+                totalScore: 0,
+                chefIds: [],
+                draftOrder: 0
+              });
+              if (!finalPlayerIds.includes(auth.currentUser.uid)) finalPlayerIds.push(auth.currentUser.uid);
+            }
+            continue;
+          }
+
+          const nameExists = rawPlayers.some(p => p.name.toLowerCase() === name.toLowerCase());
+          if (!nameExists) {
+            const playerRef = doc(collection(db, 'players'));
+            await setDoc(playerRef, {
+              name,
+              draftOrder: finalPlayerIds.length,
+              chefIds: [],
+              totalScore: 0,
+              email: null
+            });
+            finalPlayerIds.push(playerRef.id);
+          }
         } catch (err) {
           throw new Error(JSON.stringify(handleFirestoreError(err, OperationType.CREATE, 'players')));
         }
       }
       console.log('Players seeded.');
 
-      // 3. Seed Config
+      // 4. Seed Config - Use the protected draftOrder if it existed, otherwise use the new one
       try {
-        await setDoc(doc(db, 'config', 'league'), {
+        await setDoc(configRef, {
           draftStarted: false,
           draftCompleted: false,
           currentDraftTurn: 0,
-          draftOrder: playerIds,
+          draftOrder: existingDraftOrder.length > 0 ? existingDraftOrder : finalPlayerIds,
           rankingsOpen: true
-        });
+        }, { merge: true });
       } catch (err) {
         throw new Error(JSON.stringify(handleFirestoreError(err, OperationType.WRITE, 'config/league')));
       }
@@ -930,14 +1107,17 @@ export default function App() {
   return (
     <ErrorBoundary>
       <div className="min-h-screen bg-stone-100 text-stone-900 font-sans pb-20 sm:pb-0">
+        
       {status && (
         <div className={`fixed top-4 sm:top-auto sm:bottom-24 left-1/2 -translate-x-1/2 z-[100] w-[calc(100%-2rem)] sm:w-auto px-4 sm:px-6 py-2 sm:py-3 rounded-xl sm:rounded-2xl shadow-xl border flex items-center gap-2 sm:gap-3 animate-in fade-in slide-in-from-top-4 sm:slide-in-from-bottom-4 duration-300 ${
           status.type === 'success' ? 'bg-green-50 border-green-200 text-green-800' :
           status.type === 'error' ? 'bg-red-50 border-red-200 text-red-800' :
+          status.type === 'warning' ? 'bg-orange-50 border-orange-200 text-orange-800' :
           'bg-blue-50 border-blue-200 text-blue-800'
         }`}>
           {status.type === 'success' && <Trophy className="w-4 h-4 sm:w-5 sm:h-5" />}
           {status.type === 'error' && <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5" />}
+          {status.type === 'warning' && <AlertTriangle className="w-4 h-4 sm:w-5 sm:h-5 text-orange-600" />}
           {status.type === 'info' && <RefreshCw className="w-4 h-4 sm:w-5 sm:h-5 animate-spin" />}
           <span className="font-bold text-xs sm:text-sm">{status.message}</span>
           <button onClick={() => setStatus(null)} className="ml-auto sm:ml-2 opacity-50 hover:opacity-100 p-1">×</button>
@@ -977,7 +1157,22 @@ export default function App() {
             )}
           </div>
         </div>
-      </header>
+        {isAdmin && (
+        <div className="hidden sm:flex border-l border-stone-200 ml-2 pl-2">
+          <button 
+            onClick={() => setActiveTab('admin')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-black transition-all ${
+              activeTab === 'admin' 
+                ? 'bg-orange-600 text-white shadow-sm' 
+                : 'bg-orange-100 text-orange-700 hover:bg-orange-200'
+            }`}
+          >
+            <Zap className="w-3 h-3 fill-current" />
+            Season Sync
+          </button>
+        </div>
+      )}
+    </header>
 
       <main className="max-w-5xl mx-auto px-4 py-4 sm:py-6">
         {/* Desktop Navigation */}
@@ -999,7 +1194,7 @@ export default function App() {
           <NavButton active={activeTab === 'draft'} onClick={() => setActiveTab('draft')} icon={<Users className="w-4 h-4" />} label="Draft" />
           <NavButton active={activeTab === 'stats'} onClick={() => setActiveTab('stats')} icon={<BarChart3 className="w-4 h-4" />} label="Stats" />
           <NavButton active={activeTab === 'scoring'} onClick={() => setActiveTab('scoring')} icon={<Info className="w-4 h-4" />} label="Scoring" />
-          {isAdmin && <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={<ShieldCheck className="w-4 h-4" />} label="Admin" />}
+          {isAdmin && <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={<Zap className="w-4 h-4" />} label="Sync" />}
         </div>
 
         {/* Mobile Navigation (Bottom Bar) */}
@@ -1022,7 +1217,7 @@ export default function App() {
             <MobileNavButton active={activeTab === 'draft'} onClick={() => setActiveTab('draft')} icon={<Users className="w-6 h-6" />} label="Draft" />
             <MobileNavButton active={activeTab === 'stats'} onClick={() => setActiveTab('stats')} icon={<BarChart3 className="w-6 h-6" />} label="Stats" />
             <MobileNavButton active={activeTab === 'scoring'} onClick={() => setActiveTab('scoring')} icon={<Info className="w-6 h-6" />} label="Rules" />
-            {isAdmin && <MobileNavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={<ShieldCheck className="w-6 h-6" />} label="Admin" />}
+            {isAdmin && <MobileNavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={<Zap className="w-6 h-6" />} label="Sync" />}
           </div>
         </div>
 
@@ -1038,6 +1233,7 @@ export default function App() {
                 players={players} 
                 chefs={chefs} 
                 config={config} 
+                events={events}
                 user={user} 
                 comments={comments}
                 onJoin={handleJoinLeague} 
@@ -1119,12 +1315,26 @@ export default function App() {
                 isSubmittingApp={isSubmitting}
                 proxyPlayerId={proxyPlayerId}
                 setProxyPlayerId={setProxyPlayerId}
+                showStatus={showStatus}
               />
             </motion.div>
           )}
         </AnimatePresence>
       </main>
       </div>
+      {isAdmin && activeTab !== 'admin' && (
+        <motion.button
+          initial={{ scale: 0, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => setActiveTab('admin')}
+          className="fixed bottom-24 right-6 z-50 bg-orange-600 text-white p-4 rounded-full shadow-2xl flex items-center gap-2 border-2 border-white sm:bottom-8"
+        >
+          <Zap className="w-6 h-6 fill-current" />
+          <span className="font-black text-sm uppercase tracking-tighter pr-2">Sync Season</span>
+        </motion.button>
+      )}
     </ErrorBoundary>
   );
 }
@@ -1504,29 +1714,7 @@ function LandingPage({ onLogin }: { onLogin: () => void }) {
   );
 }
 
-function ProgressTable({ chefs }: { chefs: Chef[] }) {
-  const [events, setEvents] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const fetchEvents = async () => {
-      try {
-        const q = query(collection(db, 'scoreEvents'), orderBy('week', 'asc'));
-        const snap = await getDocs(q);
-        setEvents(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-      } catch (error) {
-        console.error("Error fetching score events:", error);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchEvents();
-  }, []);
-
-  if (loading) {
-    return <div className="text-center py-12 text-stone-500 font-medium">Loading progress data...</div>;
-  }
-
+function ProgressTable({ chefs, config, events }: { chefs: Chef[], config: LeagueConfig | null, events: any[] }) {
   if (events.length === 0) {
     return <div className="text-center py-12 text-stone-500 font-medium">No episode data available yet.</div>;
   }
@@ -1611,7 +1799,8 @@ function ProgressTable({ chefs }: { chefs: Chef[] }) {
         bgColor = 'bg-white';
       }
       
-      const totalPoints = weekEvents.reduce((sum, e) => sum + e.points, 0);
+      const startWeek = config?.scoringStartWeek ?? 1;
+      const totalPoints = week >= startWeek ? weekEvents.reduce((sum, e) => sum + e.points, 0) : 0;
       
       return { week, status, qfStatus, qfBgColor, qfTextColor, weekEvents, totalPoints, bgColor, textColor };
     });
@@ -1661,16 +1850,20 @@ function ProgressTable({ chefs }: { chefs: Chef[] }) {
                     {/* Tooltip for detailed events */}
                     {data.weekEvents.length > 0 && (
                       <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-48 bg-stone-900 text-white text-xs rounded-lg p-3 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-20 shadow-xl pointer-events-none">
-                        {data.weekEvents.map((evt: any, idx: number) => (
-                          <div key={idx} className="mb-1.5 last:mb-0">
-                            <div className="flex justify-between items-start gap-2">
-                              <span className="font-medium leading-tight">{evt.description}</span>
-                              <span className="font-bold text-orange-400 shrink-0">
-                                {evt.points > 0 ? '+' : ''}{evt.points}
-                              </span>
+                        {data.weekEvents.map((evt: any, idx: number) => {
+                          const startWeek = config?.scoringStartWeek ?? 1;
+                          const displayPts = data.week >= startWeek ? evt.points : 0;
+                          return (
+                            <div key={idx} className="mb-1.5 last:mb-0">
+                              <div className="flex justify-between items-start gap-2">
+                                <span className="font-medium leading-tight">{evt.description}</span>
+                                <span className={`font-bold shrink-0 ${displayPts > 0 ? 'text-orange-400' : 'text-stone-400'}`}>
+                                  {displayPts > 0 ? '+' : ''}{displayPts}
+                                </span>
+                              </div>
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                         <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-stone-900 rotate-45"></div>
                       </div>
                     )}
@@ -1697,10 +1890,11 @@ function ProgressTable({ chefs }: { chefs: Chef[] }) {
   );
 }
 
-function ScoreboardView({ players, chefs, config, user, comments, onJoin, claimId, activePoll, showStatus, maxWeek }: { 
+function ScoreboardView({ players, chefs, config, events, user, comments, onJoin, claimId, activePoll, showStatus, maxWeek }: { 
   players: Player[], 
   chefs: Chef[], 
   config: LeagueConfig | null, 
+  events: any[],
   user: User | null, 
   comments: PlayerStatus[],
   onJoin: () => void,
@@ -1716,81 +1910,9 @@ function ScoreboardView({ players, chefs, config, user, comments, onJoin, claimI
   const isPlayer = user && players.some(p => p.id === user.uid);
 
   // --- Ranking Accuracy Logic ---
-  const sortedChefs = [...chefs].sort((a, b) => {
-    if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
-    // If scores are tied, active chefs rank higher than eliminated
-    if (a.status === 'active' && b.status !== 'active') return -1;
-    if (b.status === 'active' && a.status !== 'active') return 1;
-    return 0;
-  });
-  const actualChefOrder = sortedChefs.map(c => c.id);
-
-  const playersWithBonus = useMemo(() => {
-    if (chefs.length === 0 || players.length === 0) return players.map(p => ({ ...p, rankingBonus: 0, displayScore: p.totalScore, accuracy: 0, avgDiff: 0, accuracyRank: 0 }));
-
-    // 1. Calculate raw accuracy for each player
-    const playerAccuracies = players.map(player => {
-      if (!player.rankings || player.rankings.length === 0) return { id: player.id, accuracy: 0, avgDiff: 0 };
-      
-      // Use all rankings that exist in the current chef list
-      const uniqueRankings = [...new Set(player.rankings as string[])];
-      const playerValidRankings = uniqueRankings.filter(id => actualChefOrder.includes(id));
-      const playerActualOrder = actualChefOrder.filter(id => playerValidRankings.includes(id));
-      
-      let squaredDistance = 0;
-      playerValidRankings.forEach((chefId, index) => {
-        const actualIndex = playerActualOrder.indexOf(chefId);
-        if (actualIndex !== -1) {
-          squaredDistance += Math.pow(index - actualIndex, 2);
-        }
-      });
-
-      const n = playerValidRankings.length;
-      // Bell Curve (Gaussian) scoring
-      // sigma controls how wide the bell curve is. 
-      // A sigma of 4 means an RMS of 4 gives you ~60% of the max points.
-      const sigma = 4; 
-      const avgDiff = n > 0 ? Math.sqrt(squaredDistance / n) : 0; // RMS Diff
-      
-      // Calculate raw accuracy as a point on the bell curve
-      const rawAccuracy = n > 0 ? Math.exp(-(avgDiff * avgDiff) / (2 * sigma * sigma)) : 0;
-      
-      return { id: player.id, rawAccuracy, avgDiff };
-    });
-
-    // 2. Rank players by avgDiff (lower is better)
-    const sortedByAvgDiff = [...playerAccuracies].sort((a, b) => {
-      if (a.avgDiff === 0 && b.avgDiff !== 0) return 1; // Put 0s at the end if they didn't rank
-      if (b.avgDiff === 0 && a.avgDiff !== 0) return -1;
-      return a.avgDiff - b.avgDiff;
-    });
-    
-    const maxChefScore = Math.max(...chefs.map(c => c.totalScore), 0);
-    const topRawAccuracy = Math.max(...playerAccuracies.map(p => p.rawAccuracy), 0);
-
-    return players.map(player => {
-      const accInfo = playerAccuracies.find(a => a.id === player.id);
-      const rawAcc = accInfo?.rawAccuracy || 0;
-      const avgDiff = accInfo?.avgDiff || 0;
-      const rankIndex = sortedByAvgDiff.findIndex(a => a.id === player.id);
-      
-      // Normalize so the best player gets exactly 1.0 (100% of maxChefScore)
-      const acc = topRawAccuracy > 0 ? (rawAcc / topRawAccuracy) : 0;
-      
-      // Points = maxChefScore * normalized_bell_curve_accuracy, rounded to nearest whole number
-      const rankingBonus = Math.round(maxChefScore * acc);
-      const displayScore = player.totalScore + rankingBonus;
-      
-      return { 
-        ...player, 
-        rankingBonus, 
-        displayScore, 
-        accuracy: acc,
-        avgDiff,
-        accuracyRank: rankIndex + 1
-      };
-    });
-  }, [players, chefs, actualChefOrder]);
+  const { playersWithBonus, actualChefOrder } = useMemo(() => {
+    return calculatePlayerAccuracy(players, chefs, config);
+  }, [players, chefs, config]);
 
   const sortedPlayers = [...playersWithBonus].sort((a, b) => b.displayScore - a.displayScore);
   const accuracyLeaders = [...playersWithBonus].sort((a, b) => {
@@ -2113,7 +2235,7 @@ function ScoreboardView({ players, chefs, config, user, comments, onJoin, claimI
               <History className="w-5 h-5 text-orange-600" />
               <h2 className="text-xl font-black text-stone-900 tracking-tight">Progress Table</h2>
             </div>
-            <ProgressTable chefs={chefs} />
+            <ProgressTable chefs={chefs} config={config} events={events} />
           </div>
         )}
       </div>
@@ -2682,47 +2804,10 @@ function RankingView({ chefs, player, players, config, isAdmin = false }: { chef
 
   // --- Ranking Accuracy Logic for Comparison ---
   const activeChefs = chefs.filter(c => c.status !== 'eliminated').sort((a, b) => b.totalScore - a.totalScore);
-  const sortedChefs = [...chefs].sort((a, b) => {
-    if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
-    // If scores are tied, active chefs rank higher than eliminated
-    if (a.status === 'active' && b.status !== 'active') return -1;
-    if (b.status === 'active' && a.status !== 'active') return 1;
-    return 0;
-  });
-  const actualChefOrder = sortedChefs.map(c => c.id);
-
-  const playersWithBonus = useMemo(() => {
-    if (chefs.length === 0 || players.length === 0) return players.map(p => ({ ...p, rankingBonus: 0, accuracy: 0, avgDiff: 0 }));
-
-    const playerAccuracies = players.map(p => {
-      if (!p.rankings || p.rankings.length === 0) return { id: p.id, accuracy: 0, avgDiff: 0 };
-      const uniqueRankings = [...new Set(p.rankings as string[])];
-      const playerActiveRankings = uniqueRankings.filter(id => actualChefOrder.includes(id));
-      const playerActualOrder = actualChefOrder.filter(id => playerActiveRankings.includes(id));
-      let squaredDistance = 0;
-      playerActiveRankings.forEach((chefId, index) => {
-        const actualIndex = playerActualOrder.indexOf(chefId);
-        if (actualIndex !== -1) squaredDistance += Math.pow(index - actualIndex, 2);
-      });
-      const n = playerActiveRankings.length;
-      const sigma = 4; 
-      const avgDiff = n > 0 ? Math.sqrt(squaredDistance / n) : 0; // RMSE
-      const rawAccuracy = n > 0 ? Math.exp(-(avgDiff * avgDiff) / (2 * sigma * sigma)) : 0;
-      return { id: p.id, rawAccuracy, avgDiff };
-    });
-
-    const maxChefScore = Math.max(...chefs.map(c => c.totalScore), 0);
-    const topRawAccuracy = Math.max(...playerAccuracies.map(p => p.rawAccuracy), 0);
-
-    return players.map(p => {
-      const accInfo = playerAccuracies.find(a => a.id === p.id);
-      const rawAcc = accInfo?.rawAccuracy || 0;
-      const avgDiff = accInfo?.avgDiff || 0;
-      const acc = topRawAccuracy > 0 ? (rawAcc / topRawAccuracy) : 0;
-      const rankingBonus = Math.round(maxChefScore * acc);
-      return { ...p, rankingBonus, accuracy: acc, avgDiff };
-    });
-  }, [players, chefs, actualChefOrder]);
+  
+  const { playersWithBonus, actualChefOrder } = useMemo(() => {
+    return calculatePlayerAccuracy(players, chefs, config);
+  }, [players, chefs, config]);
 
   const sortedComparison = [...playersWithBonus].sort((a, b) => {
     if (a.avgDiff === 0 && b.avgDiff !== 0) return 1;
@@ -2730,13 +2815,19 @@ function RankingView({ chefs, player, players, config, isAdmin = false }: { chef
     return a.avgDiff - b.avgDiff;
   });
 
+  const playerRankingsStr = JSON.stringify(player?.rankings || []);
   useEffect(() => {
-    if (player?.rankings) {
-      setRankedIds(player.rankings);
-    } else {
-      setRankedIds([]);
-    }
-  }, [player?.id]);
+    const baseRankings = player?.rankings || [];
+    const currentChefIds = chefs.map(c => c.id);
+    const newRankedIds = Array.from(new Set(baseRankings));
+    
+    currentChefIds.forEach(id => {
+      if (!newRankedIds.includes(id)) newRankedIds.push(id);
+    });
+    
+    const filteredRankedIds = newRankedIds.filter(id => currentChefIds.includes(id));
+    setRankedIds(filteredRankedIds);
+  }, [player?.id, playerRankingsStr, chefs]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -2754,18 +2845,6 @@ function RankingView({ chefs, player, players, config, isAdmin = false }: { chef
       coordinateGetter: sortableKeyboardCoordinates,
     })
   );
-
-  useEffect(() => {
-    const currentActiveIds = activeChefs.map(c => c.id);
-    const newRankedIds: string[] = Array.from(new Set(rankedIds)); // Remove any existing duplicates
-    currentActiveIds.forEach(id => {
-      if (!newRankedIds.includes(id)) newRankedIds.push(id);
-    });
-    const filteredRankedIds = newRankedIds.filter(id => currentActiveIds.includes(id));
-    if (JSON.stringify(filteredRankedIds) !== JSON.stringify(rankedIds)) {
-      setRankedIds(filteredRankedIds);
-    }
-  }, [chefs]);
 
   const isLocked = !config?.rankingsOpen && !isAdmin;
 
@@ -3051,14 +3130,13 @@ function ScoreRule({ label, points, sublabel, variant = 'positive' }: { label: s
 }
 
 const TOP_CHEF_SEASONS = [
-  { label: 'Season 22: Carolinas', url: 'https://en.wikipedia.org/wiki/Top_Chef:_Carolinas' },
-  { label: 'Season 22 (Alt 1)', url: 'https://en.wikipedia.org/wiki/Top_Chef_(season_22)' },
-  { label: 'Season 22 (Alt 2)', url: 'https://en.wikipedia.org/wiki/Top_Chef_(American_season_22)' },
-  { label: 'Season 22 (Alt 3)', url: 'https://en.wikipedia.org/wiki/Top_Chef_Season_22' },
-  { label: 'Season 22 (Fandom)', url: 'https://topchef.fandom.com/wiki/Top_Chef:_Carolinas' },
+  { label: 'Season 23: Carolinas', url: 'https://en.wikipedia.org/wiki/Top_Chef:_Carolinas' },
+  { label: 'Season 22: Gulf Coast', url: 'https://en.wikipedia.org/wiki/Top_Chef_(season_22)' },
+  { label: 'Season 21: Wisconsin', url: 'https://en.wikipedia.org/wiki/Top_Chef_(season_21)' },
+  { label: 'Season 20: World All-Stars', url: 'https://en.wikipedia.org/wiki/Top_Chef:_World_All-Stars' },
 ];
 
-function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: Player[], showStatus: (type: 'success' | 'error' | 'info', message: string) => void }) {
+function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], players: Player[], config: LeagueConfig | null, showStatus: (type: 'success' | 'error' | 'info' | 'warning', message: string) => void }) {
   const [wikitext, setWikitext] = useState('');
   const [url, setUrl] = useState(TOP_CHEF_SEASONS[0].url);
   const [isFetching, setIsFetching] = useState(false);
@@ -3067,6 +3145,14 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
   const [isParsing, setIsParsing] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
+  const [unmatchedNames, setUnmatchedNames] = useState<string[]>([]);
+  const [syncLogs, setSyncLogs] = useState<string[]>([]);
+  const [confirmFullReset, setConfirmFullReset] = useState(false);
+
+  const addLog = (msg: string) => {
+    setSyncLogs(prev => [msg, ...prev].slice(0, 50));
+    console.log(`[SyncLog] ${msg}`);
+  };
 
   const syncChefsFromWikitext = async () => {
     if (!wikitext) return;
@@ -3077,12 +3163,25 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
       const foundNames = new Set<string>();
       
       const cleanWikitext = (text: string) => {
-        return text.replace(/\{\{[^}]+\}\}/g, '')
-                   .replace(/\[\[([^\]|]+\|)?([^\]]+)\]\]/g, '$2')
-                   .replace(/<[^>]+>/g, '') // Remove HTML tags
-                   .replace(/&nbsp;/g, ' ')
-                   .replace(/[''\[\]!|]/g, '')
-                   .trim();
+        let clean = text;
+        // 1. Handle {{sortname|First|Last|...}} -> First Last
+        clean = clean.replace(/\{\{sortname\|([^|]+)\|([^|]+)(?:\|[^}]+)?\}\}/gi, '$1 $2');
+        // 2. Handle {{color|...|text}} or {{color|text}} -> text
+        clean = clean.replace(/\{\{color\|(?:[^|]+\|)*([^}]+)\}\}/gi, '$1');
+        // 3. Handle {{nowrap|text}} -> text
+        clean = clean.replace(/\{\{nowrap\|([^}]+)\}\}/gi, '$1');
+        // 4. Handle generic templates with parameters - try to get the last one if it looks like content
+        clean = clean.replace(/\{\{(?:[^|}]+\|)+([^}|]+)\}\}/g, '$1');
+        // 5. Standard template removal for anything left
+        clean = clean.replace(/\{\{[^}]+\}\}/g, '');
+        // 6. Handle [[File:...]] or [[Link|Text]]
+        clean = clean.replace(/\[\[(?:[^\]|]+\|)?([^\]]+)\]\]/g, '$1');
+        // 7. Remove HTML tags and basic cleanup
+        clean = clean.replace(/<[^>]+>/g, '') 
+                     .replace(/&nbsp;/g, ' ')
+                     .replace(/[''\[\]!|]/g, '')
+                     .trim();
+        return clean;
       };
 
       rows.forEach(row => {
@@ -3094,9 +3193,17 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
         if (cells.some(c => c.toLowerCase().includes('quickfire challenge'))) return;
 
         let nameCell = cells[0];
+        // Handle attributes like scope="row" | Name
+        if (nameCell.includes('|')) {
+          nameCell = nameCell.split('|').pop()?.trim() || nameCell;
+        }
+        
         const cleanFirst = nameCell.replace(/[!|]/g, '').trim();
         if (cleanFirst.match(/^\d+$/) || cleanFirst === '') {
           nameCell = cells[1];
+          if (nameCell.includes('|')) {
+            nameCell = nameCell.split('|').pop()?.trim() || nameCell;
+          }
         }
 
         let name = cleanWikitext(nameCell);
@@ -3138,13 +3245,21 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
     try {
       // Try to convert standard URL to API URL
       let apiUrl = '';
-      const titlePart = url.split('/wiki/').pop()?.split('#')[0].split('?')[0];
-      const decodedTitle = decodeURIComponent(titlePart || '');
-      const isWiki = url.includes('wikipedia.org/wiki/') || url.includes('fandom.com/wiki/');
-      const domain = isWiki ? url.split('/wiki/')[0] : '';
-      const apiPath = url.includes('wikipedia.org/wiki/') ? '/w/api.php' : '/api.php';
+      let decodedTitle = '';
+      const urlObj = new URL(url);
+      
+      if (url.includes('/w/index.php') && urlObj.searchParams.has('title')) {
+        decodedTitle = decodeURIComponent(urlObj.searchParams.get('title')!).replace(/_/g, ' ');
+      } else {
+        const titlePart = url.split('/wiki/').pop()?.split('#')[0].split('?')[0];
+        decodedTitle = decodeURIComponent(titlePart || '').replace(/_/g, ' ');
+      }
+      
+      const isWiki = url.includes('wikipedia.org') || url.includes('fandom.com');
+      const domain = isWiki ? 'https://en.wikipedia.org' : '';
+      const apiPath = '/w/api.php';
 
-      if (isWiki) {
+      if (isWiki && decodedTitle) {
         apiUrl = `${domain}${apiPath}?action=query&prop=revisions&rvprop=content&rvslots=main&titles=${encodeURIComponent(decodedTitle)}&format=json&origin=*&redirects=1`;
       } else {
         apiUrl = url;
@@ -3166,14 +3281,12 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
         if ((pageId === "-1" || page.missing === "" || page.missing === true) && isWiki) {
           setStatusMessage(`Page not found, searching Wikipedia...`);
           console.log(`Page "${decodedTitle}" not found, trying search fallback...`);
-          // Try a few search terms
+          // Try generic search based on current title or keywords
           const searchTerms = [
-            "Top Chef Carolinas",
-            "Top Chef Season 22",
-            "Top Chef (season 22)",
-            "Top Chef Carolinas progress",
-            "Top Chef 22"
-          ];
+            decodedTitle,
+            "Top Chef Season",
+            "Top Chef progress table"
+          ].filter(Boolean);
           
           let searchMatch = null;
           for (const term of searchTerms) {
@@ -3186,11 +3299,11 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
               const searchData = await searchResponse.json();
               
               if (searchData.query?.search?.length > 0) {
-                // Look for a title that contains "Top Chef" and "Season" or "Carolinas"
+                // Look for a title that contains "Top Chef"
                 const match = searchData.query.search.find((s: any) => {
                   const t = s.title.toLowerCase();
-                  return t.includes('top chef') && (t.includes('season') || t.includes('carolinas') || t.includes('22'));
-                }) || searchData.query.search[0]; // Fallback to first result if no perfect match
+                  return t.includes('top chef') && (t.includes('season') || t.includes('progress'));
+                }) || searchData.query.search[0]; 
                 
                 if (match) {
                   searchMatch = match.title;
@@ -3261,12 +3374,13 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
       const episode = parsedEpisodes[0]; // We only ever show one episode due to filtering
       
       await runTransaction(db, async (transaction) => {
+        const startWeek = config?.scoringStartWeek ?? 1;
         for (const res of episode.results) {
           const chefRef = doc(db, 'chefs', res.chefId);
 
           // 1. Update Chef
           transaction.update(chefRef, {
-            totalScore: increment(res.points),
+            totalScore: increment(episode.week >= startWeek ? res.points : 0),
             status: res.status === 'lck' ? 'lck' : (res.status === 'eliminated' ? 'eliminated' : 'active')
           });
 
@@ -3296,18 +3410,20 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
           }
 
           // 3. Update Players who own this chef
-          const owningPlayers = players.filter(p => p.chefIds.includes(res.chefId));
-          for (const player of owningPlayers) {
-            const playerRef = doc(db, 'players', player.id);
-            transaction.update(playerRef, {
-              totalScore: increment(res.points)
-            });
+          if (episode.week >= startWeek) {
+            const owningPlayers = players.filter(p => p.chefIds.includes(res.chefId));
+            for (const player of owningPlayers) {
+              const playerRef = doc(db, 'players', player.id);
+              transaction.update(playerRef, {
+                totalScore: increment(res.points)
+              });
+            }
           }
         }
       });
       showStatus('success', `Successfully applied Episode ${episode.week} results to the database!`);
       setParsedEpisodes([]);
-      setWikitext('');
+      // setWikitext(''); // Keep it for easier manual multi-week sync
     } catch (error) {
       console.error('Error applying results:', error);
       showStatus('error', 'Failed to apply results. See console for details.');
@@ -3316,12 +3432,13 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
     }
   };
 
-  const parseWikitext = () => {
-    setIsParsing(true);
-    setParsedEpisodes([]);
+  const parseWikitextEx = (sourceWikitext: string) => {
     try {
-      const rows = wikitext.split(/\|-/);
+      console.log("Parsing wikitext, length:", sourceWikitext.length);
+      const rows = sourceWikitext.split(/\|-|\{\{Top Chef\s+(?:progress|episode)\s+table\s+row/i);
+      console.log("Found rows:", rows.length);
       const episodeData = new Map<number, Map<string, { quickfire: string, quickfirePoints: number, elimination: string, eliminationPoints: number, eliminated: boolean, lck: boolean }>>();
+      const localUnmatched = new Set<string>();
       
       const maxWeeks = 16;
       for (let w = 1; w <= maxWeeks; w++) {
@@ -3329,39 +3446,150 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
       }
 
       const cleanWikitext = (text: string) => {
-        return text.replace(/\{\{[^}]+\}\}/g, '')
-                   .replace(/\[\[([^\]|]+\|)?([^\]]+)\]\]/g, '$2')
-                   .replace(/<[^>]+>/g, '') // Remove HTML tags
-                   .replace(/&nbsp;/g, ' ')
-                   .replace(/[''\[\]!|]/g, '')
-                   .trim();
+        let clean = text;
+        // 1. Handle {{sortname|First|Last|...}} -> First Last
+        clean = clean.replace(/\{\{sortname\|([^|]+)\|([^|]+)(?:\|[^}]+)?\}\}/gi, '$1 $2');
+        // 2. Handle {{color|...|text}} or {{color|text}} -> text
+        clean = clean.replace(/\{\{color\|(?:[^|]+\|)*([^}]+)\}\}/gi, '$1');
+        // 3. Handle {{nowrap|text}} -> text
+        clean = clean.replace(/\{\{nowrap\|([^}]+)\}\}/gi, '$1');
+        // 4. Handle {{Table cell|STATUS|...}} -> STATUS
+        clean = clean.replace(/\{\{Table\s+cell\|([^|]+)(?:\|[^}]+)?\}\}/gi, '$1');
+        // 4.5 Handle {{Table cell|color=...|STATUS}}
+        clean = clean.replace(/\{\{Table\s+cell\|[^}]*?\|([^|}]*?)\}\}/gi, '$1');
+        // 5. Handle generic templates with parameters - try to get a part that isn't a key=value
+        clean = clean.replace(/\{\{(?:[^|}]+\|)+([^}|]+)\}\}/g, (match, content) => {
+          if (content.includes('=')) {
+            const parts = match.replace(/[{}]/g, '').split('|');
+            for (let i = 1; i < parts.length; i++) {
+              if (!parts[i].includes('=') && parts[i].trim().length > 0) return parts[i];
+            }
+          }
+          return content;
+        });
+        // 6. Standard template removal for anything left
+        clean = clean.replace(/\{\{[^}]+\}\}/g, '');
+        // 7. Handle [[File:...]] or [[Link|Text]]
+        clean = clean.replace(/\[\[(?:[^\]|]+\|)?([^\]]+)\]\]/g, '$1');
+        // 8. Remove HTML tags and basic cleanup
+        clean = clean.replace(/<[^>]+>/g, '') 
+                     .replace(/&nbsp;/g, ' ')
+                     .replace(/[''\[\]!|]/g, '')
+                     .trim();
+        return clean;
       };
 
       const findChef = (name: string) => {
-        let clean = cleanWikitext(name);
+        let nameToMatch = name;
+        if (nameToMatch.includes('|')) {
+          nameToMatch = nameToMatch.split('|').pop()?.trim() || nameToMatch;
+        }
+        
+        let clean = cleanWikitext(nameToMatch);
         clean = clean.replace(/^\d+\s*/, '').trim();
         if (clean.length < 2 || clean.length > 30) return null;
         
-        return chefs.find(c => 
-          clean.toLowerCase() === c.name.toLowerCase() || 
-          clean.toLowerCase().includes(c.name.toLowerCase()) || 
-          c.name.toLowerCase().includes(clean.toLowerCase())
-        );
+        let searchName = clean.toLowerCase().replace(/chef\s+/g, '').trim();
+        searchName = searchName.replace(/\s*\(.*?\)\s*/g, '').trim(); // Remove (season 6) etc
+        
+        // 1. Exact match (including full name or full name from DB)
+        let found = chefs.find(c => searchName === c.name.toLowerCase());
+        if (found) return found;
+
+        // 2. Partial Match (e.g. "Savannah" matches "Savannah Miller")
+        found = chefs.find(c => {
+          const chefNameLower = c.name.toLowerCase();
+          return chefNameLower.startsWith(searchName) || searchName.startsWith(chefNameLower);
+        });
+        if (found) return found;
+
+        // 3. Handle Nicknames (e.g. "Jassi" in Jaspratap "Jassi" Bindra)
+        found = chefs.find(c => {
+          const nicknameMatch = c.name.match(/"([^"]+)"/);
+          if (nicknameMatch && nicknameMatch[1].toLowerCase() === searchName) return true;
+          return false;
+        });
+        if (found) return found;
+
+        // 4. Last Name Only (if it's long enough and unique)
+        const nameParts = searchName.split(/\s+/);
+        if (nameParts.length === 1 && searchName.length >= 4) {
+           const matches = chefs.filter(c => {
+             const parts = c.name.toLowerCase().split(/\s+/);
+             return parts[parts.length - 1] === searchName;
+           });
+           if (matches.length === 1) return matches[0];
+        }
+
+        // 5. Word Overlap (Robust match for reordered names)
+        found = chefs.find(c => {
+           const chefNameLower = c.name.toLowerCase();
+           const chefWords = chefNameLower.replace(/"/g, '').split(/\s+/).filter(w => w.length >= 2);
+           const targetWords = searchName.split(/\s+/).filter(w => w.length >= 2);
+           if (chefWords.length === 0 || targetWords.length === 0) return false;
+           
+           // If any target word matches a chef name word accurately
+           return targetWords.some(tw => chefWords.includes(tw)) || chefWords.some(cw => targetWords.includes(cw));
+        });
+        if (found) return found;
+        
+        console.warn(`Unmatched chef name from Wiki: "${clean}" (Searched for: "${searchName}")`);
+        localUnmatched.add(clean);
+        return null;
       };
 
+      let lastAiredWeek = 0;
+
       rows.forEach((row) => {
+        if (!row.trim()) return;
         if (row.includes('ShortSummary') || row.includes('LineColor') || row.includes('EpisodeSummary')) return;
         
-        const normalizedRow = row.replace(/\n[|!]/g, ' || ');
-        const cells = normalizedRow.split(/\|\||!!/).map(c => c.trim()).filter(c => c !== '');
+        let cells: string[] = [];
+        let isTemplateRow = false;
+
+        // Handle Template-style row: {{Top Chef progress table row |chef=... |w1=...}}
+        if (row.includes('|chef=') || row.includes('|EP')) {
+           const params: Record<string, string> = {};
+           row.split('|').forEach(p => {
+             const eqIdx = p.indexOf('=');
+             if (eqIdx !== -1) {
+               const k = p.substring(0, eqIdx).trim().toLowerCase();
+               const v = p.substring(eqIdx + 1).replace(/\}\}$|\]\]$/g, '').trim();
+               params[k] = v;
+             }
+           });
+           
+           if (params.chef) {
+             cells = [params.chef];
+             isTemplateRow = true;
+             // Extract week-by-week results
+             for (let i = 1; i <= maxWeeks; i++) {
+               cells.push(params[`w${i}`] || params[`ep${i}`] || params[i.toString()] || '');
+             }
+           }
+        }
+        
+        if (cells.length < 2) {
+           const normalizedRow = row.replace(/\n\s*[|!]/g, ' || ');
+           // If the row still has no double-bars but has multiple single bars, it might be a single-bar row
+           if (!normalizedRow.includes('||') && (normalizedRow.match(/\|/g) || []).length > 2) {
+             cells = normalizedRow.split(/\|/).map(c => c.trim()).filter(c => c !== '');
+           } else {
+             cells = normalizedRow.split(/\|\||!!/).map(c => c.trim()).filter(c => c !== '');
+           }
+        }
+
         if (cells.length < 2) return;
 
+        // --- Case 1: Quickfire Header Row ---
         const isQuickfireRow = cells.some(c => c.toLowerCase().includes('quickfire challenge'));
         
         if (isQuickfireRow) {
           cells.forEach((cell, index) => {
             if (index === 0) return;
             const week = index;
+            if (week > maxWeeks) return;
+            
             const lines = cell.split(/<br\s*\/?>|\n/i);
             lines.forEach(line => {
               const text = line.trim();
@@ -3379,6 +3607,7 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
                 const matchedChef = findChef(rawName);
                 
                 if (matchedChef) {
+                  lastAiredWeek = Math.max(lastAiredWeek, week);
                   const weekMap = episodeData.get(week);
                   if (weekMap) {
                     const current = weekMap.get(matchedChef.id) || { quickfire: '', quickfirePoints: 0, elimination: '', eliminationPoints: 0, eliminated: false, lck: false };
@@ -3388,58 +3617,152 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
               }
             });
           });
-        } else {
+        } 
+        // --- Case 2: Last Chance Kitchen Table Rows (Winner & Loser) ---
+        else if (cells.length >= 3 && cells[0].match(/^\d+/) && (cells[2].toLowerCase().includes('win') || cells[2].toLowerCase().includes('return') || cells.some(c => c.toLowerCase().includes('win')))) {
+          const weekPart = cells[0].match(/(\d+)/)?.[1];
+          const week = weekPart ? parseInt(weekPart) : 0;
+          
+          if (week > 0 && week <= maxWeeks) {
+            const resultCell = cells[2];
+            const contestantsCell = cells[1];
+            
+            const winnerChef = findChef(resultCell);
+            const isReturning = cells.some(c => c.toLowerCase().includes('return')) || cells.some(c => c.toLowerCase().includes('rejoin'));
+
+            // Find all chefs in the contestants cell
+            chefs.forEach(chef => {
+              const namesToMatch = [chef.name, chef.name.split(' ')[0]];
+              const isContestant = namesToMatch.some(n => n.length > 2 && contestantsCell.includes(n));
+              
+              if (isContestant) {
+                const weekMap = episodeData.get(week) || new Map();
+                episodeData.set(week, weekMap);
+                const current = weekMap.get(chef.id) || { quickfire: '', quickfirePoints: 0, elimination: 'Safe', eliminationPoints: 0, eliminated: false, lck: false };
+                
+                const isWinner = winnerChef?.id === chef.id;
+                
+                if (isWinner) {
+                  lastAiredWeek = Math.max(lastAiredWeek, week);
+                  weekMap.set(chef.id, { 
+                    ...current, 
+                    quickfire: isReturning ? 'Returned from LCK' : 'LCK Win', 
+                    quickfirePoints: current.quickfirePoints + 2,
+                    lck: !isReturning,
+                    eliminated: !isReturning 
+                  });
+                } else if (winnerChef) {
+                  lastAiredWeek = Math.max(lastAiredWeek, week);
+                  // This chef was in the match and LOST
+                  weekMap.set(chef.id, {
+                    ...current,
+                    lck: false,
+                    eliminated: true
+                  });
+                }
+              }
+            });
+          }
+        }
+        // --- Case 3: Progress Grid ---
+        else {
           let nameCell = cells[0];
           let scoreStartIndex = 1;
+          
+          if (nameCell.includes('|')) {
+            nameCell = nameCell.split('|').pop()?.trim() || nameCell;
+          }
+          
           const cleanFirst = nameCell.replace(/[!|]/g, '').trim();
           if (cleanFirst.match(/^\d+$/) || cleanFirst === '') {
             nameCell = cells[1];
+            if (nameCell.includes('|')) {
+              nameCell = nameCell.split('|').pop()?.trim() || nameCell;
+            }
             scoreStartIndex = 2;
           }
 
           const matchedChef = findChef(nameCell);
           if (matchedChef) {
             let currentWeek = 1;
-            // Skip metadata columns (like Hometown) before the first score cell
-            let firstScoreIndex = scoreStartIndex;
-            while (firstScoreIndex < cells.length) {
-              const cellUpper = cells[firstScoreIndex].toUpperCase();
-              if (cellUpper.includes('IN') || cellUpper.includes('WIN') || cellUpper.includes('HIGH') || 
-                  cellUpper.includes('LOW') || cellUpper.includes('OUT') || cellUpper.includes('ELIM') || 
-                  cellUpper.includes('LCK') || cellUpper.includes('SAFE')) {
-                break;
-              }
-              firstScoreIndex++;
-            }
-
-            cells.slice(firstScoreIndex).forEach((cell) => {
-              // Handle colspan
+            // The cells starting from scoreStartIndex are the results for each week.
+            // We usually don't need to 'look' for the first result anymore because
+            // we trust the standard Top Chef progress table structure:
+            // | RANK | NAME | EP1 | EP2 | ...
+            // or
+            // | NAME | EP1 | EP2 | ...
+            cells.slice(scoreStartIndex).forEach((cell) => {
               let span = 1;
               const spanMatch = cell.match(/colspan="?(\d+)"?/i);
               if (spanMatch) span = parseInt(spanMatch[1]);
 
-              const cellNoTemplates = cell.replace(/\{\{[^}]+\}\}/g, '');
+              const cellNoTemplates = cell.replace(/\{\{([^}]+)\}\}/g, (match, p1) => {
+                const parts = p1.split('|');
+                return parts[parts.length - 1]; 
+              }).replace(/\{\{[^}]+\}\}/g, '');
+              
               const cellUpper = cellNoTemplates.toUpperCase();
               let cellContent = cellNoTemplates;
               if (cellContent.includes('|')) {
                 cellContent = cellContent.split('|').pop()?.trim() || '';
               }
-              const upperCell = cellContent.toUpperCase();
+              const upperCell = cellContent.toUpperCase().replace(/[''\[\]!|0-9¹²³⁴⁵⁶⁷⁸⁹]/g, '').trim();
               
               let type = '';
               let points = 0;
               let eliminated = false;
               let inLCK = false;
 
-              if (upperCell.includes('WINNER')) { type = 'Winner'; points = 30; }
-              else if (upperCell.includes('RUNNER-UP')) { type = 'Runner-Up'; points = 15; }
-              else if (upperCell.includes('LCK WIN') || upperCell.includes('LAST CHANCE KITCHEN WIN')) { type = 'Last Chance Kitchen Win'; points = 2; inLCK = true; }
-              else if (upperCell.includes('WIN')) { type = 'Elimination Win'; points = 7; }
-              else if (upperCell.includes('HIGH')) { type = 'Top'; points = 4; }
-              else if (upperCell.includes('LOW')) { type = 'Bottom'; points = -2; }
-              else if (upperCell.includes('OUT') || upperCell.includes('ELIM')) { type = 'Eliminated'; points = -2; eliminated = true; }
-              else if (upperCell === 'IN' || upperCell === 'SAFE') { type = 'Safe'; points = 0; }
-              else if (upperCell.includes('LCK')) { type = 'In LCK'; points = 0; inLCK = true; }
+              const isRealResult = upperCell !== '' && upperCell !== '—' && !upperCell.includes('TBA');
+              
+              // Standard Top Chef Status Detection (Extremely robust for Hex codes and variations)
+              const isWin = /\bWIN\b|\bWINNER\b|★/.test(upperCell) || 
+                            cellUpper.includes('COLOR:LIGHTBLUE') || cellUpper.includes('BACKGROUND:LIGHTBLUE') ||
+                            cellUpper.includes('BGCOLOR=#AFEEEE') || cellUpper.includes('STYLE="BACKGROUND:#AFEEEE"') ||
+                            cellUpper.includes('BGCOLOR="#AFEEEE"') || cellUpper.includes('BACKGROUND:#AFEEEE');
+                            
+              const isHigh = /\bHIGH\b|\bTOP\b|↑/.test(upperCell) || 
+                             cellUpper.includes('COLOR:AQUA') || cellUpper.includes('BACKGROUND:AQUA') || 
+                             cellUpper.includes('COLOR:AZURE') || cellUpper.includes('BGCOLOR=#E0FFFF') ||
+                             cellUpper.includes('STYLE="BACKGROUND:#E0FFFF"') || cellUpper.includes('BGCOLOR="#E0FFFF"') ||
+                             cellUpper.includes('BACKGROUND:#E0FFFF');
+                             
+              const isLow = /\bLOW\b|\bBOTTOM\b|↓/.test(upperCell) || 
+                            cellUpper.includes('COLOR:LIGHTCORAL') || cellUpper.includes('BACKGROUND:LIGHTCORAL') || 
+                            cellUpper.includes('COLOR:PINK') || cellUpper.includes('BGCOLOR=#FFC0CB') ||
+                            cellUpper.includes('STYLE="BACKGROUND:#FFC0CB"') || cellUpper.includes('BGCOLOR="#FFC0CB"') ||
+                            cellUpper.includes('BACKGROUND:#FFC0CB') ||
+                            cellUpper.includes('COLOR:TOMATO') || cellUpper.includes('BACKGROUND:TOMATO') ||
+                            cellUpper.includes('BGCOLOR=#FF6347') || cellUpper.includes('STYLE="BACKGROUND:#FF6347"') ||
+                            cellUpper.includes('BGCOLOR="#FF6347"') || cellUpper.includes('BACKGROUND:#FF6347');
+                            
+              const isOut = /\bOUT\b|\bELIM\b|\bELIMINATED\b/.test(upperCell) || 
+                            cellUpper.includes('COLOR:DARKGRAY') || cellUpper.includes('COLOR:DARKGREY');
+                            
+              const isSafe = /\bSAFE\b|\bIN\b|^S$/.test(upperCell) || 
+                             cellUpper.includes('COLOR:LIGHTGREY') || cellUpper.includes('BACKGROUND:LIGHTGREY') ||
+                             cellUpper.includes('BGCOLOR=#D3D3D3') || cellUpper.includes('STYLE="BACKGROUND:#D3D3D3"') ||
+                             cellUpper.includes('BGCOLOR="#D3D3D3"') || cellUpper.includes('BACKGROUND:#D3D3D3');
+
+              const isReturn = /\bRETURN\b|\bRET\b/.test(upperCell) || 
+                               cellUpper.includes('COLOR:LIGHTGREEN') || cellUpper.includes('BACKGROUND:LIGHTGREEN') ||
+                               cellUpper.includes('COLOR:GREEN') || cellUpper.includes('BACKGROUND:GREEN');
+
+              if (isRealResult) {
+                if (upperCell.includes('WINNER')) { type = 'Winner'; points = 30; }
+                else if (upperCell.includes('RUNNER-UP')) { type = 'Runner-Up'; points = 15; }
+                else if (upperCell.includes('LCK WIN') || upperCell.includes('LAST CHANCE KITCHEN WIN')) { type = 'Last Chance Kitchen Win'; points = 2; inLCK = true; }
+                else if (isReturn) { type = 'Returned from LCK'; points = 2; inLCK = true; eliminated = false; }
+                else if (isWin) { type = 'Elimination Win'; points = 7; }
+                else if (isHigh) { type = 'Top'; points = 4; }
+                else if (isLow) { type = 'Bottom'; points = -2; }
+                else if (upperCell.includes('MED')) { type = 'Medically Removed'; points = 0; eliminated = true; }
+                else if (isOut) { type = 'Eliminated'; points = -2; eliminated = true; }
+                else if (isSafe) { type = 'Safe'; points = 0; }
+                else if (upperCell.includes('LCK')) { type = 'In LCK'; points = 0; inLCK = true; }
+                
+                if (type) console.log(`[Parser] Result for ${matchedChef.name} Week ${currentWeek}: ${type} (${points} pts) - Cell: "${upperCell}"`);
+              }
               
               const isDarkGrey = cellUpper.includes('DARKGREY') || cellUpper.includes('DARKGRAY');
               if (isDarkGrey) eliminated = true;
@@ -3447,32 +3770,27 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
               for (let s = 0; s < span; s++) {
                 const week = currentWeek + s;
                 if (week > maxWeeks) break;
+                
+                if (isRealResult && type && type !== 'N/A') {
+                  lastAiredWeek = Math.max(lastAiredWeek, week);
+                }
 
-                const weekMap = episodeData.get(week);
-                if (weekMap) {
-                  const current = weekMap.get(matchedChef.id) || { quickfire: '', quickfirePoints: 0, elimination: '', eliminationPoints: 0, eliminated: false, lck: false };
-                  
-                  // Only award points on the first week of a colspan, and only if they weren't already eliminated in a previous week
-                  let wasEliminatedPreviously = false;
-                  for (let prevW = 1; prevW < week; prevW++) {
-                    if (episodeData.get(prevW)?.get(matchedChef.id)?.eliminated) {
-                      wasEliminatedPreviously = true;
-                      break;
-                    }
-                  }
+                const weekMap = episodeData.get(week) || new Map();
+                episodeData.set(week, weekMap);
 
-                  if (s === 0 || eliminated || isDarkGrey || inLCK) {
-                    const finalType = (eliminated || isDarkGrey) ? (wasEliminatedPreviously ? 'Already Eliminated' : 'Eliminated') : (inLCK ? 'In LCK' : (s === 0 ? type : 'N/A'));
-                    const finalPoints = (s === 0 && !wasEliminatedPreviously) ? points : 0;
-                    
-                    weekMap.set(matchedChef.id, { 
-                      ...current, 
-                      elimination: finalType || current.elimination, 
-                      eliminationPoints: current.eliminationPoints + finalPoints, 
-                      eliminated: current.eliminated || eliminated || isDarkGrey,
-                      lck: current.lck || inLCK
-                    });
-                  }
+                const current = weekMap.get(matchedChef.id) || { quickfire: '', quickfirePoints: 0, elimination: '', eliminationPoints: 0, eliminated: false, lck: false };
+                
+                if (isRealResult && (s === 0 || eliminated || inLCK)) {
+                  const isMed = type === 'Medically Removed';
+                  weekMap.set(matchedChef.id, { 
+                    ...current, 
+                    elimination: type || current.elimination, 
+                    eliminationPoints: current.eliminationPoints + points, 
+                    eliminated: current.eliminated || eliminated,
+                    lck: isMed ? false : (current.lck || inLCK)
+                  });
+                } else if (isDarkGrey) {
+                   weekMap.set(matchedChef.id, { ...current, eliminated: true });
                 }
               }
               currentWeek += span;
@@ -3481,62 +3799,511 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
         }
       });
 
+      // Extract Last Chance Kitchen Wikipedia {{Episode list}} blocks
+      const lckMatch = sourceWikitext.match(/==\s*'{0,3}Last Chance Kitchen'{0,3}\s*==([\s\S]*?(?:==|$))/i);
+      if (lckMatch) {
+         const lckText = lckMatch[1];
+         const lckBlocks = lckText.split(/\{\{\s*Episode list/i).slice(1);
+         
+         lckBlocks.forEach((block) => {
+            const epMatch = block.match(/\|\s*EpisodeNumber\s*=\s*(\d+)/i);
+            const winnerMatch = block.match(/\*+\s*'{0,3}Winners?:?'{0,3}\s*([^\n]+)/i);
+            
+            if (epMatch && winnerMatch) {
+               const lckEpNum = parseInt(epMatch[1]);
+               // LCK Episode 1 usually corresponds to Week 2 of the main competition
+               const week = lckEpNum + 1; 
+               
+               lastAiredWeek = Math.max(lastAiredWeek, week);
+
+               // Extract winner names and clean them
+               const winnersRaw = winnerMatch[1].replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
+                                                .replace(/\[\[([^\]]+)\]\]/g, '$1')
+                                                .replace(/\{\{color\|(?:[^|]+\|)*([^}]+)\}\}/gi, '$1')
+                                                .replace(/\{\{[^}]+\}\}/g, '').trim();
+               
+               const winners = winnersRaw.split(/\b(?:and|&)\b|,/i).map(s => s.trim()).filter(s => s.length > 0);
+               
+               winners.forEach(winnerName => {
+                  const matchedChef = findChef(winnerName);
+                  if (matchedChef && week <= maxWeeks) {
+                     const weekMap = episodeData.get(week) || new Map();
+                     episodeData.set(week, weekMap);
+                     const current = weekMap.get(matchedChef.id) || { quickfire: '', quickfirePoints: 0, elimination: '', eliminationPoints: 0, eliminated: true, lck: true };
+                     
+                     // Only add the 2 points if they haven't already received them from the grid
+                     if (current.quickfire !== 'LCK Win' && current.quickfire !== 'Returned from LCK' && current.elimination !== 'Last Chance Kitchen Win' && current.elimination !== 'Returned from LCK') {
+                       weekMap.set(matchedChef.id, {
+                          ...current,
+                          quickfire: 'LCK Win',
+                          quickfirePoints: current.quickfirePoints + 2,
+                          eliminated: true, 
+                          lck: true
+                       });
+                       console.log(`[Parser] Parsed LCK Wiki Ep ${lckEpNum} Win for ${matchedChef.name} at Week ${week}`);
+                     }
+                  }
+               });
+               
+               const elimMatch = block.match(/\*+\s*'{0,3}Eliminated:?'{0,3}\s*([^\n]+)/i);
+               if (elimMatch) {
+                   const elimRaw = elimMatch[1].replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2').replace(/\[\[([^\]]+)\]\]/g, '$1').replace(/\{\{[^}]+\}\}/g, '').trim();
+                   const elims = elimRaw.split(/\b(?:and|&|or|None)\b|,|-/i).map(s => s.trim()).filter(s => s.length > 0);
+                   elims.forEach(elimName => {
+                      if (elimName.toLowerCase() === 'none') return;
+                      const matchedChef = findChef(elimName);
+                      if (matchedChef && week <= maxWeeks) {
+                         const weekMap = episodeData.get(week) || new Map();
+                         episodeData.set(week, weekMap);
+                         const current = weekMap.get(matchedChef.id) || { quickfire: '', quickfirePoints: 0, elimination: '', eliminationPoints: 0, eliminated: true, lck: true };
+                         
+                         weekMap.set(matchedChef.id, {
+                            ...current,
+                            elimination: 'Eliminated from LCK',
+                            eliminated: true,
+                            lck: false 
+                         });
+                      }
+                   });
+               }
+            }
+         });
+      }
+
       const finalEpisodes = [];
-      for (let w = 1; w <= maxWeeks; w++) {
-        const weekMap = episodeData.get(w);
-        if (!weekMap) continue;
+      const limitWeek = Math.min(maxWeeks, lastAiredWeek);
+
+      // State tracking to inherit statuses across weeks
+      const runningStatus = new Map<string, { eliminated: boolean, lck: boolean }>();
+      chefs.forEach(c => runningStatus.set(c.id, { eliminated: false, lck: false }));
+
+      for (let w = 1; w <= limitWeek; w++) {
+        const weekMap = episodeData.get(w) || new Map();
 
         chefs.forEach(chef => {
-          if (!weekMap.has(chef.id)) {
-            let wasEliminated = false;
-            let wasInLCK = false;
-            for (let prevW = 1; prevW < w; prevW++) {
-              const prevData = episodeData.get(prevW)?.get(chef.id);
-              if (prevData?.eliminated) wasEliminated = true;
-              if (prevData?.lck) wasInLCK = true;
-            }
-            weekMap.set(chef.id, {
+          let data = weekMap.get(chef.id);
+          const lastStatus = runningStatus.get(chef.id)!;
+
+          if (!data) {
+            data = {
               quickfire: 'N/A',
               quickfirePoints: 0,
-              elimination: wasEliminated ? (wasInLCK ? 'In LCK' : 'Already Eliminated') : 'Safe',
+              elimination: lastStatus.eliminated ? (lastStatus.lck ? 'In LCK' : 'Already Eliminated') : 'Safe',
               eliminationPoints: 0,
-              eliminated: wasEliminated,
-              lck: wasInLCK
-            });
+              eliminated: lastStatus.eliminated,
+              lck: lastStatus.lck
+            };
+            weekMap.set(chef.id, data);
+          } else {
+            if (!data.elimination) {
+               data.elimination = lastStatus.eliminated ? (lastStatus.lck ? 'In LCK' : 'Already Eliminated') : 'Safe';
+            }
+            if (lastStatus.eliminated && !data.quickfire.includes('Return')) {
+               data.eliminated = true;
+               if (lastStatus.lck && data.lck === undefined) data.lck = true;
+            }
           }
+          
+          runningStatus.set(chef.id, { 
+            eliminated: !!data.eliminated, 
+            lck: !!data.lck 
+          });
         });
 
-        const results = Array.from(weekMap.entries()).map(([chefId, data]) => ({
-          chefId,
-          chefName: chefs.find(c => c.id === chefId)?.name || 'Unknown',
-          quickfire: data.quickfire || 'N/A',
-          quickfirePoints: data.quickfirePoints,
-          elimination: data.elimination || 'N/A',
-          eliminationPoints: data.eliminationPoints,
-          points: data.quickfirePoints + data.eliminationPoints,
-          status: data.lck ? 'lck' as const : (data.eliminated ? 'eliminated' as const : 'active' as const)
-        })).sort((a, b) => b.points - a.points || a.chefName.localeCompare(b.chefName));
+        const results = Array.from(weekMap.entries()).map(([chefId, data]) => {
+          let sweepBonus = 0;
+          if (data.quickfire === 'Quickfire Win' && data.elimination === 'Elimination Win') {
+            sweepBonus = 3;
+          }
+          
+          return {
+            chefId,
+            chefName: chefs.find(c => c.id === chefId)?.name || 'Unknown',
+            quickfire: data.quickfire || 'N/A',
+            quickfirePoints: data.quickfirePoints || 0,
+            elimination: data.elimination || 'N/A',
+            eliminationPoints: data.eliminationPoints || 0,
+            sweepBonus,
+            points: (data.quickfirePoints || 0) + (data.eliminationPoints || 0) + sweepBonus,
+            status: data.lck ? 'lck' as const : (data.eliminated ? 'eliminated' as const : 'active' as const)
+          };
+        }).sort((a, b) => b.points - a.points || a.chefName.localeCompare(b.chefName));
 
-        if (results.some(r => r.quickfire !== 'N/A' || r.elimination !== 'Safe' || r.status === 'eliminated')) {
+        if (results.some(r => r.quickfire !== 'N/A' || r.elimination !== 'Safe' || r.status !== 'active')) {
           finalEpisodes.push({ week: w, results });
         }
       }
 
-      setParsedEpisodes(finalEpisodes.filter(ep => ep.week === selectedWeek));
-      if (finalEpisodes.length === 0) showStatus('error', 'No matching chefs found.');
-      else if (!finalEpisodes.some(ep => ep.week === selectedWeek)) {
-        showStatus('error', `No data found for Episode ${selectedWeek}. Please check your selection or the wikitext.`);
-      }
+      return { finalEpisodes, localUnmatched: Array.from(localUnmatched) };
     } catch (error) {
       console.error('Parsing error:', error);
+      return null;
+    }
+  };
+
+  const parseWikitext = () => {
+    setIsParsing(true);
+    setParsedEpisodes([]);
+    setUnmatchedNames([]);
+    
+    const result = parseWikitextEx(wikitext);
+    if (!result) {
       showStatus('error', 'Error parsing wikitext. See console for details.');
-    } finally {
       setIsParsing(false);
+      return;
+    }
+
+    const { finalEpisodes, localUnmatched } = result;
+    setUnmatchedNames(localUnmatched);
+    setParsedEpisodes(finalEpisodes.filter(ep => ep.week === selectedWeek));
+    
+    if (finalEpisodes.length === 0 && localUnmatched.length === 0) showStatus('error', 'No matching chefs found.');
+    else if (finalEpisodes.length === 0) {
+      showStatus('error', `Parsed ${localUnmatched.length} names but none matched your database chefs.`);
+    }
+    else if (!finalEpisodes.some(ep => ep.week === selectedWeek)) {
+      showStatus('error', `No data found for Episode ${selectedWeek}. Please check your selection or the wikitext.`);
+    }
+    setIsParsing(false);
+  };
+
+  const fetchWikitextHelper = async (fetchUrl: string) => {
+    console.log("fetchWikitextHelper called with:", fetchUrl);
+    try {
+      let decodedTitle;
+      const urlObj = new URL(fetchUrl);
+      if (fetchUrl.includes('/w/index.php') && urlObj.searchParams.has('title')) {
+        decodedTitle = decodeURIComponent(urlObj.searchParams.get('title')!).replace(/_/g, ' ');
+      } else {
+        const titlePart = fetchUrl.split('/wiki/').pop()?.split('#')[0].split('?')[0];
+        if (!titlePart) throw new Error("Could not extract title from URL");
+        decodedTitle = decodeURIComponent(titlePart).replace(/_/g, ' ');
+      }
+      
+      const isWiki = fetchUrl.includes('wikipedia.org') || fetchUrl.includes('fandom.com');
+      const domain = isWiki ? 'https://en.wikipedia.org' : '';
+      const apiPath = '/w/api.php';
+      
+      if (!domain) throw new Error("Invalid Wiki domain extracted from URL");
+
+      const apiUrl = `${domain}${apiPath}?action=query&prop=revisions&rvprop=content&rvslots=main&titles=${encodeURIComponent(decodedTitle)}&format=json&origin=*&redirects=1`;
+      console.log("Calling proxy for:", apiUrl);
+      
+      const response = await fetch(`/api/proxy?url=${encodeURIComponent(apiUrl)}`);
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const data = await response.json();
+      
+      if (data.query && data.query.pages) {
+        const pages = data.query.pages;
+        const pageId = Object.keys(pages)[0];
+        const page = pages[pageId];
+        
+        if (pageId === "-1" || page.missing === "" || page.missing === true) {
+          throw new Error(`Page "${decodedTitle}" not found.`);
+        }
+
+        const content = page.revisions?.[0]?.slots?.main?.['*'] || page.revisions?.[0]?.['*'];
+        if (content) return content;
+      }
+      throw new Error("No wikitext content found in response");
+    } catch (error: any) {
+      console.error('Fetch helper error details:', error);
+      throw error; // Let the caller catch it
+    }
+  };
+
+  const magicSync = async (forceFull = false) => {
+    addLog(`Initiating ${forceFull ? 'Full Reset' : 'Magic Sync'}...`);
+    if (isApplying || isFetching) {
+      addLog("WARNING: Sync already in progress.");
+      showStatus('info', 'A sync is already in progress. Please wait.');
+      return;
+    }
+
+    if (!url || !url.includes('http')) {
+      addLog("ERROR: Invalid URL.");
+      showStatus('error', 'Please provide a valid Wikipedia URL first.');
+      return;
+    }
+
+    if (chefs.length === 0) {
+      addLog("ERROR: No chefs loaded.");
+      showStatus('error', 'Chefs data not loaded yet. Please wait a moment.');
+      return;
+    }
+
+    setSyncLogs([]);
+    setIsApplying(true);
+    setStatusMessage(forceFull ? 'Resetting League Data...' : 'Starting Magic Sync...');
+    try {
+      addLog("Phase 1: Fetching data from Wikipedia...");
+      setStatusMessage('Fetching latest Wikipedia data...');
+      const fetchedWikitext = await fetchWikitextHelper(url);
+      if (!fetchedWikitext) throw new Error('No content received from Wikipedia.');
+      
+      addLog("Phase 2: Parsing competition results...");
+      setWikitext(fetchedWikitext);
+      setStatusMessage('Parsing competition data...');
+
+      const parseResult = parseWikitextEx(fetchedWikitext);
+      if (!parseResult) throw new Error('Parsing failed.');
+      
+      addLog(`Parsed ${parseResult.finalEpisodes.length} episodes and ${parseResult.localUnmatched.length} unmatched names.`);
+
+      if (parseResult.finalEpisodes.length === 0) {
+        throw new Error('No episode data found. Ensure the "Contestant progress" table is present on the page.');
+      }
+
+      setUnmatchedNames(parseResult.localUnmatched);
+      let episodesToSync = parseResult.finalEpisodes;
+
+      if (forceFull) {
+        addLog("DANGER: Wiping all existing scores from database...");
+        setStatusMessage('Clearing database scores...');
+        
+        const eventsQuery = await getDocs(collection(db, 'scoreEvents'));
+        addLog(`Deleting ${eventsQuery.size} existing score events...`);
+        const batchSize = 100;
+        for (let i = 0; i < eventsQuery.docs.length; i += batchSize) {
+          const batch = eventsQuery.docs.slice(i, i + batchSize);
+          await Promise.all(batch.map(d => deleteDoc(d.ref)));
+        }
+
+        addLog("Resetting all chef scores to zero...");
+        for (const chef of chefs) {
+          await updateDoc(doc(db, 'chefs', chef.id), { totalScore: 0, status: 'active' });
+        }
+
+        addLog("Resetting all player scores to zero...");
+        for (const player of players) {
+          await updateDoc(doc(db, 'players', player.id), { totalScore: 0 });
+        }
+        
+        addLog("Database reset clean. Proceeding with fresh sync.");
+      } else {
+        addLog("Searching for new episodes missing from database...");
+        const existingEventsQuery = await getDocs(collection(db, 'scoreEvents'));
+        const existingWeeks = new Set(existingEventsQuery.docs.map(doc => doc.data().week));
+        episodesToSync = parseResult.finalEpisodes.filter(ep => !existingWeeks.has(ep.week));
+        
+        if (episodesToSync.length === 0) {
+          addLog("Database is already up to date.");
+          showStatus('info', 'Your database is already up to date!');
+          setIsApplying(false);
+          return;
+        }
+        addLog(`Found ${episodesToSync.length} new weeks to apply: ${episodesToSync.map(e => e.week).join(', ')}`);
+      }
+
+      addLog("Applying episode data to database via transactions...");
+      let totalPoints = 0;
+      let totalEvents = 0;
+
+      for (const episode of episodesToSync) {
+        addLog(`Syncing Week ${episode.week}...`);
+        let weekPointsAwarded = 0;
+        let weekChefsUpdated = 0;
+
+        await runTransaction(db, async (transaction) => {
+          const startWeek = config?.scoringStartWeek ?? 1;
+          for (const res of episode.results) {
+            const chefRef = doc(db, 'chefs', res.chefId);
+            const chefData = chefs.find(c => c.id === res.chefId);
+            
+            // 1. Update Chef
+            transaction.update(chefRef, {
+              totalScore: increment(episode.week >= startWeek ? res.points : 0),
+              status: res.status
+            });
+
+            if (res.points !== 0 && episode.week >= startWeek) {
+              totalPoints += res.points;
+              weekPointsAwarded += res.points;
+              weekChefsUpdated++;
+            }
+
+            // 2. Score Events
+            if (res.quickfire !== 'N/A' && res.quickfirePoints !== 0) {
+              transaction.set(doc(collection(db, 'scoreEvents')), {
+                chefId: res.chefId, week: episode.week, type: res.quickfire,
+                points: res.quickfirePoints, description: `Quickfire: ${res.quickfire}`,
+                timestamp: serverTimestamp()
+              });
+              totalEvents++;
+            }
+            if (res.elimination !== 'Safe' && res.elimination !== 'N/A' && res.elimination !== 'Already Eliminated' && res.elimination !== 'In LCK') {
+              // We should save this even if eliminationPoints === 0 (e.g. LCK Eliminated)
+              transaction.set(doc(collection(db, 'scoreEvents')), {
+                chefId: res.chefId, week: episode.week, type: res.elimination,
+                points: res.eliminationPoints, description: `Elimination: ${res.elimination}`,
+                timestamp: serverTimestamp()
+              });
+              totalEvents++;
+            }
+
+            // 3. Update Owners
+            // Only update owner score if the episode week is >= scoringStartWeek
+            if (episode.week >= startWeek) {
+              const owners = players.filter(p => p.chefIds.includes(res.chefId));
+              for (const p of owners) {
+                transaction.update(doc(db, 'players', p.id), { totalScore: increment(res.points) });
+              }
+            }
+          }
+        });
+        addLog(`Week ${episode.week} finished: ${weekChefsUpdated ? weekChefsUpdated : 'All'} chefs processed, ${weekPointsAwarded} points total.`);
+      }
+
+      // 4. Update maxWeek in season config
+      const maxEpWeek = Math.max(...parseResult.finalEpisodes.map(ep => ep.week), 0);
+      const configRef = doc(db, 'config', 'season');
+      await setDoc(configRef, { maxWeek: maxEpWeek }, { merge: true });
+      addLog(`Updated season config with maxWeek: ${maxEpWeek}`);
+
+      addLog(`Sync completed successfully! Awarded ${totalPoints} total points.`);
+      if (totalPoints === 0 && totalEvents === 0) {
+        showStatus('warning', 'Sync complete, but 0 points awarded. Chef name mismatch possible.');
+      } else {
+        showStatus('success', forceFull ? 'Full Re-sync Complete!' : 'Magic Sync Successful!');
+      }
+    } catch (error: any) {
+      addLog(`FATAL ERROR: ${error.message}`);
+      showStatus('error', `Sync failed: ${error.message}`);
+    } finally {
+      setIsApplying(false);
+      setIsFetching(false);
+      setConfirmFullReset(false);
     }
   };
 
   return (
     <div className="space-y-6">
+      <div className="bg-stone-900 text-white rounded-2xl p-6 space-y-4 shadow-xl border border-stone-800">
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="space-y-1 text-center sm:text-left">
+            <h3 className="text-lg font-bold flex items-center justify-center sm:justify-start gap-2">
+              <Zap className="w-5 h-5 text-orange-500 fill-orange-500" />
+              Magic Season Sync
+            </h3>
+            <p className="text-xs text-stone-400">
+              Update ALL scores for the entire season in one click.
+            </p>
+          </div>
+          <div className="flex flex-col gap-3 w-full sm:w-80">
+            <div className="space-y-1.5">
+              <button 
+                onClick={() => magicSync(false)}
+                disabled={isFetching || isApplying}
+                className="w-full bg-gradient-to-br from-orange-500 to-red-600 hover:from-orange-400 hover:to-red-500 text-white px-8 py-5 rounded-2xl font-black text-xl transition-all shadow-xl shadow-orange-900/40 flex flex-col items-center justify-center gap-1 disabled:opacity-50 active:scale-[0.98] border-b-4 border-red-800"
+              >
+                <div className="flex items-center gap-3">
+                  {isApplying && !statusMessage.includes('complete') ? <RefreshCw className="w-6 h-6 animate-spin" /> : <Zap className="w-6 h-6 fill-white" />}
+                  <span>MAGIC SYNC ALL WEEKS</span>
+                </div>
+                <span className="text-[10px] opacity-80 uppercase tracking-widest font-bold">One-click season update</span>
+              </button>
+              <p className="text-[9px] text-stone-500 text-center font-medium uppercase tracking-tight px-2">
+                Adds missing weeks without touching existing scores
+              </p>
+            </div>
+
+            {statusMessage && (isFetching || isApplying) && (
+              <div className="bg-orange-950/30 border border-orange-900/50 rounded-lg p-2 flex items-center gap-2">
+                <RefreshCw className="w-3 h-3 text-orange-500 animate-spin" />
+                <span className="text-[10px] font-bold text-orange-400 animate-pulse uppercase tracking-wider">
+                  {statusMessage}
+                </span>
+              </div>
+            )}
+
+            <div className="h-px bg-stone-800 my-1" />
+
+            <div className="space-y-1.5">
+              {!confirmFullReset ? (
+                <button 
+                  onClick={() => setConfirmFullReset(true)}
+                  disabled={isFetching || isApplying}
+                  className={`w-full px-6 py-3 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-2 border ${
+                    isFetching || isApplying 
+                    ? 'bg-stone-800 border-stone-700 text-stone-500 cursor-not-allowed' 
+                    : 'bg-stone-800/50 border-stone-700 text-stone-300 hover:bg-red-900/20 hover:border-red-900/50 hover:text-red-400 active:scale-[0.98]'
+                  }`}
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Full Season Reset & Re-sync
+                </button>
+              ) : (
+                <div className="p-2 border border-red-900/50 bg-red-950/20 rounded-xl space-y-2">
+                  <p className="text-[10px] text-red-200 text-center font-bold uppercase leading-tight">
+                    Confirm Wipe? This will delete all history and recalculate everything.
+                  </p>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => magicSync(true)}
+                      className="flex-1 bg-red-600 hover:bg-red-500 text-white py-2 rounded-lg text-xs font-bold transition-all"
+                    >
+                      Yes, Wipe & Sync
+                    </button>
+                    <button 
+                      onClick={() => setConfirmFullReset(false)}
+                      className="flex-1 bg-stone-700 hover:bg-stone-600 text-stone-200 py-2 rounded-lg text-xs font-bold transition-all"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+              <p className="text-[9px] text-red-500/60 text-center font-medium uppercase tracking-tight px-2">
+                Danger Zone: Clears AND Recalculates everything
+              </p>
+            </div>
+
+            {(isFetching || isApplying) && (
+              <button 
+                onClick={() => { setIsFetching(false); setIsApplying(false); setStatusMessage(''); }} 
+                className="text-[9px] text-orange-400/60 hover:text-orange-400 hover:underline mt-2 text-center w-full"
+              >
+                Sync showing stuck? Click here to unlock
+              </button>
+            )}
+
+            {syncLogs.length > 0 && (
+              <div className="mt-4 p-3 bg-black/40 border border-stone-800 rounded-xl overflow-hidden">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[9px] font-bold text-stone-500 uppercase tracking-widest">Process Logs</span>
+                  <button onClick={() => setSyncLogs([])} className="text-[9px] text-stone-600 hover:text-stone-400">Clear</button>
+                </div>
+                <div className="max-h-32 overflow-y-auto space-y-1 font-mono text-[9px] text-stone-400 scrollbar-hide">
+                  {syncLogs.map((log, i) => (
+                    <div key={i} className={`flex gap-2 ${log.includes('ERROR') ? 'text-red-400' : log.includes('WARNING') ? 'text-orange-400' : ''}`}>
+                      <span className="opacity-30">[{syncLogs.length - i}]</span>
+                      <span>{log}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-stone-50 border border-stone-200 rounded-2xl p-4 space-y-3">
+        <div className="flex items-start gap-3">
+          <div className="bg-orange-100 p-2 rounded-lg">
+            <HelpCircle className="w-4 h-4 text-orange-600" />
+          </div>
+          <div className="space-y-1">
+            <h4 className="text-sm font-bold text-stone-900">How to use this scraper</h4>
+            <p className="text-[10px] text-stone-500 leading-relaxed">
+              1. Provide a Wikipedia URL below and click <strong>Fetch</strong> or use a <strong>Quick Select</strong> button.<br />
+              2. Click <strong>Magic Season Sync</strong> above to automatically fetch, parse, and apply all missing weeks to your database.<br />
+              3. If you have manual data, paste it into the <strong>Wikitext</strong> box, select the <strong>Episode</strong>, and click <strong>Parse & Preview</strong>.<br />
+              <span className="text-orange-600 font-semibold italic">Tip: If pasting manually, copy both the "Contestant progress" AND "Last Chance Kitchen" tables.</span>
+            </p>
+          </div>
+        </div>
+      </div>
+
       <div className="space-y-4">
         <div className="space-y-2">
           <label className="text-xs font-bold uppercase text-stone-400 tracking-wider flex items-center gap-2">
@@ -3614,9 +4381,9 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
                   ))}
                 </select>
               </div>
-              <p className="text-[10px] text-stone-400 italic">
-                Tip: Copy the entire "Contestant progress" table from the Wikipedia edit screen.
-              </p>
+                <p className="text-[10px] text-stone-400 italic">
+                  Tip: Copy both the "Contestant progress" AND "Last Chance Kitchen" tables from the Wikipedia edit screen.
+                </p>
             </div>
             <div className="flex items-center gap-2">
               <button 
@@ -3639,6 +4406,26 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
           </div>
         </div>
       </div>
+
+      {unmatchedNames.length > 0 && (
+        <div className="bg-orange-50 border border-orange-100 rounded-2xl p-4 space-y-2 translate-y-[-8px]">
+          <div className="flex items-center gap-2 text-orange-800 font-bold text-sm">
+            <AlertCircle className="w-4 h-4" />
+            Unmatched Names Found in Wikitext
+          </div>
+          <p className="text-[10px] text-orange-700 leading-relaxed italic">
+            Wait! These names were found in the table but don't match any chefs in your database. 
+            You might need to rename your chefs to match Wikipedia exactly (e.g. "Savannah" vs "Savannah Miller").
+          </p>
+          <div className="flex flex-wrap gap-1.5 pt-1">
+            {unmatchedNames.map(name => (
+              <span key={name} className="px-2 py-1 bg-white border border-orange-200 rounded-lg text-[10px] font-bold text-orange-900 shadow-sm">
+                {name}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {parsedEpisodes.length > 0 && (
         <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
@@ -3729,7 +4516,7 @@ function ScraperTool({ chefs, players, showStatus }: { chefs: Chef[], players: P
   );
 }
 
-function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDraft, isSubmittingApp, proxyPlayerId, setProxyPlayerId }: { 
+function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDraft, isSubmittingApp, proxyPlayerId, setProxyPlayerId, showStatus }: { 
   chefs: Chef[], 
   players: Player[], 
   seedData: () => void, 
@@ -3738,25 +4525,38 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
   onFullAutoDraft: () => Promise<void>,
   isSubmittingApp: boolean,
   proxyPlayerId: string,
-  setProxyPlayerId: (id: string) => void
+  setProxyPlayerId: (id: string) => void,
+  showStatus: (type: 'success' | 'error' | 'info' | 'warning', message: string) => void
 }) {
   const [selectedChefId, setSelectedChefId] = useState<string>('');
   const [selectedType, setSelectedType] = useState<string>(SCORING_RULES[0].type);
   const [week, setWeek] = useState(2);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isAdminSubmitting, setIsAdminSubmitting] = useState(false);
   const [bulkNames, setBulkNames] = useState('');
-  const [status, setStatus] = useState<{ type: 'success' | 'error' | 'info', message: string } | null>(null);
+  const [inviteCode, setInviteCode] = useState(config?.inviteCode || '');
+  const [scoringStartWeek, setScoringStartWeek] = useState<number>(config?.scoringStartWeek || 1);
+  const [showDraftOrderEditor, setShowDraftOrderEditor] = useState(false);
+  const [editedDraftOrder, setEditedDraftOrder] = useState<string[]>(config?.draftOrder || []);
 
-  const showStatus = (type: 'success' | 'error' | 'info', message: string) => {
-    setStatus({ type, message });
-    setTimeout(() => setStatus(null), 5000);
-  };
+  useEffect(() => {
+    if (config?.draftOrder) {
+      setEditedDraftOrder(config.draftOrder);
+    }
+    if (config?.inviteCode !== undefined) {
+      setInviteCode(config.inviteCode);
+    }
+    if (config?.scoringStartWeek !== undefined) {
+      setScoringStartWeek(config.scoringStartWeek);
+    }
+  }, [config?.draftOrder, config?.inviteCode, config?.scoringStartWeek]);
+
+  const isLocked = isAdminSubmitting || isSubmittingApp;
 
   const handleBulkRename = async () => {
     const names = bulkNames.split('\n').map(n => n.trim()).filter(n => n !== '');
     if (names.length === 0) return;
 
-    setIsSubmitting(true);
+    setIsAdminSubmitting(true);
     try {
       // Sort chefs by current name to have a predictable order for bulk renaming
       const sortedChefs = [...chefs].sort((a, b) => a.name.localeCompare(b.name));
@@ -3772,13 +4572,13 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
     } catch (error) {
       showStatus('error', 'Failed to rename chefs.');
     } finally {
-      setIsSubmitting(false);
+      setIsAdminSubmitting(false);
     }
   };
 
   const handleAddScore = async () => {
-    if (!selectedChefId || isSubmitting) return;
-    setIsSubmitting(true);
+    if (!selectedChefId || isLocked) return;
+    setIsAdminSubmitting(true);
 
     const rule = SCORING_RULES.find(r => r.type === selectedType);
     if (!rule) return;
@@ -3798,18 +4598,21 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
 
         // Update Chef Score
         const chefRef = doc(db, 'chefs', selectedChefId);
+        const startWeek = config?.scoringStartWeek ?? 1;
         transaction.update(chefRef, {
-          totalScore: increment(rule.points),
+          totalScore: increment(week >= startWeek ? rule.points : 0),
           status: selectedType === 'Eliminated' ? 'eliminated' : 'active'
         });
 
         // Update Player Score (if chef is owned)
-        const player = players.find(p => p.chefIds.includes(selectedChefId));
-        if (player) {
-          const playerRef = doc(db, 'players', player.id);
-          transaction.update(playerRef, {
-            totalScore: increment(rule.points)
-          });
+        if (week >= startWeek) {
+          const player = players.find(p => p.chefIds.includes(selectedChefId));
+          if (player) {
+            const playerRef = doc(db, 'players', player.id);
+            transaction.update(playerRef, {
+              totalScore: increment(rule.points)
+            });
+          }
         }
       });
       showStatus('success', 'Score updated successfully!');
@@ -3817,7 +4620,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
       handleFirestoreError(error, OperationType.WRITE, 'scoreEvents');
       showStatus('error', 'Score update failed.');
     } finally {
-      setIsSubmitting(false);
+      setIsAdminSubmitting(false);
     }
   };
 
@@ -3832,8 +4635,8 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
   };
 
   const randomizeDraftOrder = async () => {
-    if (!config || config.draftStarted || isSubmitting) return;
-    setIsSubmitting(true);
+    if (!config || config.draftStarted || isLocked) return;
+    setIsAdminSubmitting(true);
     try {
       const newOrder = [...config.draftOrder].sort(() => Math.random() - 0.5);
       await updateDoc(doc(db, 'config', 'league'), {
@@ -3843,7 +4646,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
     } catch (error) {
       showStatus('error', 'Failed to randomize draft order.');
     } finally {
-      setIsSubmitting(false);
+      setIsAdminSubmitting(false);
     }
   };
 
@@ -3851,9 +4654,9 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
   const [mergeTargetId, setMergeTargetId] = useState('');
 
   const handleMergePlayers = async () => {
-    if (!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId || isSubmitting) return;
+    if (!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId || isLocked) return;
     
-    setIsSubmitting(true);
+    setIsAdminSubmitting(true);
     try {
       const source = players.find(p => p.id === mergeSourceId);
       const target = players.find(p => p.id === mergeTargetId);
@@ -3891,23 +4694,53 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
       console.error(error);
       showStatus('error', 'Merge failed.');
     } finally {
-      setIsSubmitting(false);
+      setIsAdminSubmitting(false);
     }
   };
 
-  const proxyPlayer = players.find(p => p.id === proxyPlayerId);
+  const saveDraftOrder = async () => {
+    if (!config || isLocked) return;
+    setIsAdminSubmitting(true);
+    try {
+      await updateDoc(doc(db, 'config', 'league'), { draftOrder: editedDraftOrder });
+      showStatus('success', 'Draft order saved successfully!');
+      setShowDraftOrderEditor(false);
+    } catch (error) {
+      showStatus('error', 'Failed to save draft order.');
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
 
-  const [inviteCode, setInviteCode] = useState(config?.inviteCode || '');
+  const moveOrder = (index: number, direction: 'up' | 'down') => {
+    const newOrder = [...editedDraftOrder];
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= newOrder.length) return;
+    [newOrder[index], newOrder[targetIndex]] = [newOrder[targetIndex], newOrder[index]];
+    setEditedDraftOrder(newOrder);
+  };
 
   const updateInviteCode = async () => {
-    setIsSubmitting(true);
+    setIsAdminSubmitting(true);
     try {
       await updateDoc(doc(db, 'config', 'league'), { inviteCode });
       showStatus('success', 'Invite code updated!');
     } catch (error) {
       showStatus('error', 'Failed to update invite code.');
     } finally {
-      setIsSubmitting(false);
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const updateScoringStartWeek = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      await updateDoc(doc(db, 'config', 'league'), { scoringStartWeek });
+      showStatus('success', 'Scoring start week updated!');
+    } catch (error) {
+      showStatus('error', 'Failed to update scoring start week.');
+    } finally {
+      setIsAdminSubmitting(false);
     }
   };
 
@@ -3930,7 +4763,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
       return;
     }
     
-    setIsSubmitting(true);
+    setIsAdminSubmitting(true);
     try {
       await runTransaction(db, async (transaction) => {
         // 1. Delete all score events
@@ -3948,15 +4781,19 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
         // 3. Reset players
         const playersSnap = await getDocs(collection(db, 'players'));
         playersSnap.docs.forEach(doc => {
-          transaction.update(doc.ref, { totalScore: 0 });
+          transaction.update(doc.ref, { totalScore: 0, rankingBonus: 0 });
         });
+        
+        // 4. Reset maxWeek
+        const configRef = doc(db, 'config', 'season');
+        transaction.set(configRef, { maxWeek: 0 }, { merge: true });
       });
       showStatus('success', 'All scores have been reset successfully.');
     } catch (error) {
       console.error("Error clearing scores:", error);
       showStatus('error', 'Failed to clear scores.');
     } finally {
-      setIsSubmitting(false);
+      setIsAdminSubmitting(false);
       target.dataset.confirm = 'false';
       target.innerText = 'Clear All Scores';
       target.classList.remove('bg-red-600', 'text-white');
@@ -3964,21 +4801,410 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
     }
   };
 
+  const applyChelseaPicks = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const chelsea = players.find(p => p.name.toLowerCase().includes('chelsea'));
+      if (!chelsea) {
+        showStatus('error', "Could not find a player named Chelsea.");
+        return;
+      }
+      const findChefId = (namePart: string) => {
+        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
+        return chef ? chef.id : null;
+      };
+
+      const picks = [
+        findChefId("Laurence Louie"),
+        findChefId("Jonathan Dearden"),
+        findChefId("Brandon Dearden"),
+        findChefId("Rhoda Mag"),
+        findChefId("Brittany Coch"),
+        findChefId("Oscar Dia"),
+        findChefId("Sieger Bayer"),
+        findChefId("Sherry Cardo"),
+        findChefId("Duyen Ha"),
+        findChefId("Jassi"),
+        findChefId("Jennifer Lee"),
+        findChefId("Justin Tootla"),
+        findChefId("Anthony Jones"), // Put at bottom
+        findChefId("Nana Arab") // Put at bottom
+      ].filter(id => id !== null) as string[];
+
+      // Make sure we have 14 picks
+      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
+      const finalPicks = [...picks, ...remainingIds];
+
+      await updateDoc(doc(db, 'players', chelsea.id), { rankings: finalPicks });
+      showStatus('success', "Applied Chelsea's picks successfully!");
+    } catch (e: any) {
+      console.error(e);
+      showStatus('error', "Failed to apply picks: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const applyChrisPicks = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const chris = players.find(p => p.name.toLowerCase().includes('chris'));
+      if (!chris) {
+        showStatus('error', "Could not find a player named Chris.");
+        return;
+      }
+      const findChefId = (namePart: string) => {
+        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
+        return chef ? chef.id : null;
+      };
+
+      const picks = [
+        findChefId("Anthony Jones"),
+        findChefId("Jassi"),
+        findChefId("Nana Arab"),
+        findChefId("Sieger Bayer"),
+        findChefId("Jennifer Lee"),
+        findChefId("Sherry Cardo"),
+        findChefId("Brittany Coch"),
+        findChefId("Laurence Louie"),
+        findChefId("Jonathan Dearden"),
+        findChefId("Justin Tootla"),
+        findChefId("Brandon Dearden"),
+        findChefId("Duyen Ha"),
+      ].filter(id => id !== null) as string[];
+
+      // Make sure we have 14 picks
+      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
+      const finalPicks = [...picks, ...remainingIds];
+
+      await updateDoc(doc(db, 'players', chris.id), { rankings: finalPicks });
+      showStatus('success', "Applied Chris's picks successfully!");
+    } catch (e: any) {
+      console.error(e);
+      showStatus('error', "Failed to apply picks: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const applyShanePicks = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const shane = players.find(p => p.name.toLowerCase().includes('shane'));
+      if (!shane) {
+        showStatus('error', "Could not find a player named Shane.");
+        return;
+      }
+      const findChefId = (namePart: string) => {
+        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
+        return chef ? chef.id : null;
+      };
+
+      const picks = [
+        findChefId("Rhoda"),
+        findChefId("Duyen"),
+        findChefId("Anthony"),
+        findChefId("Jassi"),
+        findChefId("Sherry"),
+        findChefId("Jennifer"),
+        findChefId("Oscar"),
+        findChefId("Nana"),
+        findChefId("Jonathan"),
+        findChefId("Brandon"),
+        findChefId("Sieger"),
+        findChefId("Justin"),
+        findChefId("Laurence"),
+        findChefId("Brittany Coch"),
+      ].filter(id => id !== null) as string[];
+
+      // Make sure we have 14 picks
+      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
+      const finalPicks = [...picks, ...remainingIds];
+
+      await updateDoc(doc(db, 'players', shane.id), { rankings: finalPicks });
+      showStatus('success', "Applied Shane's picks successfully!");
+    } catch (e: any) {
+      console.error(e);
+      showStatus('error', "Failed to apply picks: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const applyLoriPicks = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const lori = players.find(p => p.name.toLowerCase().includes('lori'));
+      if (!lori) {
+        showStatus('error', "Could not find a player named Lori.");
+        return;
+      }
+      const findChefId = (namePart: string) => {
+        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
+        return chef ? chef.id : null;
+      };
+
+      const picks = [
+        findChefId("Duyen Ha"),
+        findChefId("Brandon Dearden"),
+        findChefId("Laurence Louie"),
+        findChefId("Sherry Cardoso"),
+        findChefId("Sieger Bayer"),
+        findChefId("Rhoda Mag"),
+        findChefId("Anthony Jones"),
+        findChefId("Jonathan Dearden"),
+        findChefId("Oscar Diaz"),
+        findChefId("Jassi Bindra"),
+        findChefId("Brittany Coch"),
+        findChefId("Jennifer Lee"),
+        findChefId("Justin Tootla"),
+        findChefId("Nana Arab"),
+      ].filter(id => id !== null) as string[];
+
+      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
+      const finalPicks = [...picks, ...remainingIds];
+
+      await updateDoc(doc(db, 'players', lori.id), { rankings: finalPicks });
+      showStatus('success', "Applied Lori's picks successfully!");
+    } catch (e: any) {
+      console.error(e);
+      showStatus('error', "Failed to apply picks: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const applyTravisPicks = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const travis = players.find(p => p.name.toLowerCase().includes('travis'));
+      if (!travis) {
+        showStatus('error', "Could not find a player named Travis.");
+        return;
+      }
+      const findChefId = (namePart: string) => {
+        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
+        return chef ? chef.id : null;
+      };
+
+      const picks = [
+        findChefId("Rhoda"),
+        findChefId("Brandon"),
+        findChefId("Jonathan"),
+        findChefId("Anthony"),
+        findChefId("Duyen"),
+        findChefId("Oscar"),
+        findChefId("Sherry"),
+        findChefId("Sieger"),
+        findChefId("Laurence"),
+        findChefId("Jassi"),
+        findChefId("Justin"),
+        findChefId("Jennifer"),
+        findChefId("Brittany"),
+        findChefId("Nana"),
+      ].filter(id => id !== null) as string[];
+
+      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
+      const finalPicks = [...picks, ...remainingIds];
+
+      await updateDoc(doc(db, 'players', travis.id), { rankings: finalPicks });
+      showStatus('success', "Applied Travis's picks successfully!");
+    } catch (e: any) {
+      console.error(e);
+      showStatus('error', "Failed to apply picks: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const applyAnnaPicks = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const anna = players.find(p => p.name.toLowerCase().includes('anna'));
+      if (!anna) {
+        showStatus('error', "Could not find a player named Anna.");
+        return;
+      }
+      const findChefId = (namePart: string) => {
+        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
+        return chef ? chef.id : null;
+      };
+
+      const picks = [
+        findChefId("Rhoda"),
+        findChefId("Anthony"),
+        findChefId("Duyen"),
+        findChefId("Sherry"),
+        findChefId("Oscar"),
+        findChefId("Jonathan"),
+        findChefId("Laurence"),
+        findChefId("Nana"),
+        findChefId("Sieger"),
+        findChefId("Jassi"),
+        findChefId("Brittany"),
+        findChefId("Brandon"),
+        findChefId("Jennifer"),
+        findChefId("Justin")
+      ].filter(id => id !== null) as string[];
+
+      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
+      const finalPicks = [...picks, ...remainingIds];
+
+      await updateDoc(doc(db, 'players', anna.id), { rankings: finalPicks });
+      showStatus('success', "Applied Anna's picks successfully!");
+    } catch (e: any) {
+      console.error(e);
+      showStatus('error', "Failed to apply picks: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const applyGarrettPicks = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const garrett = players.find(p => p.name.toLowerCase().includes('garrett'));
+      if (!garrett) {
+        showStatus('error', "Could not find a player named Garrett.");
+        return;
+      }
+      const findChefId = (namePart: string) => {
+        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
+        return chef ? chef.id : null;
+      };
+
+      // Since he only knows Duyen and Brittany were his top picks, put them first.
+      const picks = [
+        findChefId("Duyen Ha"),
+        findChefId("Brittany Coch"),
+      ].filter(id => id !== null) as string[];
+
+      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
+      const finalPicks = [...picks, ...remainingIds];
+
+      await updateDoc(doc(db, 'players', garrett.id), { rankings: finalPicks });
+      showStatus('success', "Applied Garrett's partial picks successfully!");
+    } catch (e: any) {
+      console.error(e);
+      showStatus('error', "Failed to apply picks: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  const recoverDraftOrder = async () => {
+    setIsAdminSubmitting(true);
+    try {
+      const findPlayerId = (namePart: string) => {
+        const player = players.find(p => p.name.toLowerCase().includes(namePart.toLowerCase()));
+        return player ? player.id : null;
+      };
+
+      const chrisId = findPlayerId('chris');
+      const chelseaId = findPlayerId('chelsea');
+      const shaneId = findPlayerId('shane');
+      const garrettId = findPlayerId('garrett');
+      const travisId = findPlayerId('travis');
+      const annaId = findPlayerId('anna');
+      const loriId = findPlayerId('lori');
+
+      const expectedOrder = [chrisId, chelseaId, shaneId, garrettId, travisId, annaId, loriId].filter(id => id !== null) as string[];
+      
+      // Keep any others at the end
+      const remainingIds = players.map(p => p.id).filter(id => !expectedOrder.includes(id));
+      const finalOrder = [...expectedOrder, ...remainingIds];
+
+      await updateDoc(doc(db, 'config', 'league'), { draftOrder: finalOrder });
+      showStatus('success', 'Draft order recovered!');
+    } catch (e: any) {
+       console.error(e);
+       showStatus('error', "Failed to recover draft order: " + e.message);
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
   return (
     <div className="space-y-6 sm:space-y-8">
-      {status && (
-        <div className={`fixed bottom-24 left-1/2 -translate-x-1/2 z-[100] px-6 py-3 rounded-2xl shadow-xl border flex items-center gap-3 animate-in fade-in slide-in-from-bottom-4 duration-300 ${
-          status.type === 'success' ? 'bg-green-50 border-green-200 text-green-800' :
-          status.type === 'error' ? 'bg-red-50 border-red-200 text-red-800' :
-          'bg-blue-50 border-blue-200 text-blue-800'
-        }`}>
-          {status.type === 'success' && <Trophy className="w-5 h-5" />}
-          {status.type === 'error' && <AlertCircle className="w-5 h-5" />}
-          {status.type === 'info' && <RefreshCw className="w-5 h-5 animate-spin" />}
-          <span className="font-bold text-sm">{status.message}</span>
-          <button onClick={() => setStatus(null)} className="ml-2 opacity-50 hover:opacity-100">×</button>
+      {/* 1. Scraper First (Primary Sync Tool) */}
+      <div className="bg-white rounded-2xl border-2 border-orange-500/20 p-4 sm:p-8 shadow-xl shadow-orange-950/5 relative overflow-hidden">
+        <div className="absolute top-0 right-0 p-4 opacity-5 pointer-events-none">
+          <Zap className="w-24 h-24 text-orange-500" />
         </div>
-      )}
+        <h2 className="text-xl sm:text-2xl font-black mb-4 sm:mb-6 flex items-center gap-3 text-stone-900 uppercase tracking-tight">
+          <Zap className="w-6 h-6 text-orange-600 fill-orange-600" />
+          Season scoring scraper (MAGIC SYNC)
+          <span className="ml-2 px-2 py-0.5 bg-orange-100 text-orange-700 text-[10px] font-black rounded-full">BETA</span>
+        </h2>
+        <ScraperTool chefs={chefs} players={players} config={config} showStatus={showStatus} />
+      </div>
+
+      {/* Recovery Settings */}
+      <div className="bg-red-50 p-6 rounded-3xl border border-red-200 shadow-sm relative overflow-hidden">
+        <div className="flex items-center gap-2 mb-6">
+          <AlertCircle className="w-5 h-5 text-red-600" />
+          <h3 className="text-lg font-black text-red-900 uppercase tracking-tight">Data Recovery</h3>
+        </div>
+        <p className="text-xs text-red-800 mb-4 font-medium uppercase tracking-tight">One-time tools to recover lost data.</p>
+        <div className="flex flex-wrap gap-3">
+          <button 
+            onClick={applyChelseaPicks}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Chelsea's Draft Rankings
+          </button>
+          <button 
+            onClick={applyChrisPicks}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Chris's Draft Rankings
+          </button>
+          <button 
+            onClick={applyShanePicks}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Shane's Draft Rankings
+          </button>
+          <button 
+            onClick={applyLoriPicks}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Lori's Draft Rankings
+          </button>
+          <button 
+            onClick={applyTravisPicks}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Travis's Draft Rankings
+          </button>
+          <button 
+            onClick={applyAnnaPicks}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Anna's Draft Rankings
+          </button>
+          <button 
+            onClick={applyGarrettPicks}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Garrett's Draft Rankings
+          </button>
+          <button 
+            onClick={recoverDraftOrder}
+            disabled={isAdminSubmitting}
+            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
+          >
+            Recover Original Draft Order
+          </button>
+        </div>
+      </div>
 
       {/* League Security */}
       <div className="bg-white p-6 rounded-3xl border border-stone-200 shadow-sm">
@@ -3999,7 +5225,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
               />
               <button 
                 onClick={updateInviteCode}
-                disabled={isSubmitting}
+                disabled={isLocked}
                 className="bg-stone-900 text-white px-6 py-2 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50"
               >
                 Save
@@ -4009,53 +5235,165 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
               New players will be asked for this code before they can join the league.
             </p>
           </div>
+          
+          <div className="pt-4 border-t border-stone-100">
+            <label className="block text-[10px] font-black uppercase text-stone-400 mb-1 ml-1">Scoring Start Week</label>
+            <div className="flex gap-2">
+              <input 
+                type="number" 
+                min="1"
+                max="16"
+                value={scoringStartWeek}
+                onChange={(e) => setScoringStartWeek(parseInt(e.target.value) || 1)}
+                 className="flex-1 bg-stone-50 border border-stone-200 rounded-xl px-4 py-2 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-orange-500"
+              />
+              <button 
+                onClick={updateScoringStartWeek}
+                disabled={isLocked}
+                className="bg-stone-900 text-white px-6 py-2 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50"
+              >
+                Save
+              </button>
+            </div>
+            <p className="text-[10px] text-stone-400 mt-2 italic">
+              Players will not accumulate points for events that occur before this week. (e.g. If you draft after Week 1, set this to 2). Applies during score updates or Magic Sync.
+            </p>
+          </div>
         </div>
       </div>
 
       <div className="bg-white rounded-2xl border border-stone-200 p-4 sm:p-8 shadow-sm">
-        <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">League Controls</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+          <h2 className="text-xl sm:text-2xl font-bold flex items-center gap-2">
+            <Layout className="w-6 h-6 text-orange-500" />
+            Season Control & Drafting
+          </h2>
+          <div className="flex gap-2">
+            <button 
+              onClick={() => setShowDraftOrderEditor(!showDraftOrderEditor)}
+              className="px-4 py-2 bg-stone-100 text-stone-700 rounded-lg font-bold text-sm hover:bg-stone-200 flex items-center gap-2"
+            >
+              <ArrowRightLeft className="w-4 h-4" />
+              {showDraftOrderEditor ? 'Hide Editor' : 'Edit Pick Order'}
+            </button>
+          </div>
+        </div>
+
+        {showDraftOrderEditor && (
+          <div className="mb-8 border-2 border-stone-100 rounded-2xl overflow-hidden animate-in fade-in slide-in-from-top-2 duration-300">
+            <div className="bg-stone-50 p-4 border-b border-stone-100 flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-stone-900">Manual Draft Order Editor</h3>
+                <p className="text-xs text-stone-500">Drag to reorder isn't available, use arrow buttons to adjust the picking sequence.</p>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={randomizeDraftOrder}
+                  disabled={isLocked || config?.draftStarted}
+                  className="px-3 py-1.5 bg-white border border-stone-200 text-stone-600 rounded-lg text-xs font-bold hover:bg-stone-50 transition-colors flex items-center gap-1"
+                >
+                  <Dice5 className="w-3.5 h-3.5" />
+                  Randomize
+                </button>
+                <button
+                  onClick={saveDraftOrder}
+                  disabled={isLocked}
+                  className="px-4 py-1.5 bg-green-600 text-white rounded-lg text-xs font-bold hover:bg-green-700 transition-colors flex items-center gap-1 shadow-sm"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  Save Order
+                </button>
+              </div>
+            </div>
+            <div className="max-h-[400px] overflow-y-auto divide-y divide-stone-50 bg-white">
+              {editedDraftOrder.map((pid, idx) => {
+                const p = players.find(player => player.id === pid);
+                return (
+                  <div key={`${pid}-${idx}`} className="flex items-center justify-between p-4 hover:bg-stone-50/50 transition-colors">
+                    <div className="flex items-center gap-4">
+                      <div className="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center text-xs font-mono font-bold text-stone-400">
+                        {idx + 1}
+                      </div>
+                      <div>
+                        <div className="font-bold text-stone-900">{p?.name || 'Unknown Player'}</div>
+                        <div className="text-[10px] text-stone-400 font-mono">{pid}</div>
+                      </div>
+                    </div>
+                    <div className="flex gap-1">
+                      <button 
+                        onClick={() => moveOrder(idx, 'up')} 
+                        disabled={idx === 0}
+                        className="p-2 hover:bg-stone-100 text-stone-400 hover:text-stone-900 rounded-lg transition-colors disabled:opacity-10"
+                      >
+                        <ChevronUp className="w-5 h-5" />
+                      </button>
+                      <button 
+                        onClick={() => moveOrder(idx, 'down')} 
+                        disabled={idx === editedDraftOrder.length - 1}
+                        className="p-2 hover:bg-stone-100 text-stone-400 hover:text-stone-900 rounded-lg transition-colors disabled:opacity-10"
+                      >
+                        <ChevronDown className="w-5 h-5" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
           <button 
             onClick={seedData}
-            disabled={isSubmitting}
-            className="flex items-center justify-center gap-2 bg-stone-100 text-stone-600 p-4 rounded-xl font-bold hover:bg-stone-200 transition-all disabled:opacity-50 min-h-[44px]"
+            disabled={isLocked}
+            className="flex flex-col items-center justify-center gap-2 bg-stone-50 border border-stone-200 text-stone-600 p-6 rounded-2xl font-bold hover:bg-stone-100 transition-all disabled:opacity-50 text-center"
           >
-            <RefreshCw className="w-5 h-5" />
-            Reset League
+            <RefreshCw className="w-6 h-6 mb-1 text-orange-500" />
+            <div className="text-stone-900">Reset Season Data</div>
+            <div className="text-[10px] font-normal text-stone-400">Clears chefs && events for new season</div>
           </button>
+          
           <button 
-            onClick={randomizeDraftOrder}
-            disabled={isSubmitting || config?.draftStarted}
-            className="flex items-center justify-center gap-2 bg-stone-100 text-stone-600 p-4 rounded-xl font-bold hover:bg-stone-200 transition-all disabled:opacity-50 min-h-[44px]"
+            onClick={handleClearScores}
+            disabled={isLocked}
+            className="flex flex-col items-center justify-center gap-2 bg-stone-50 border border-stone-200 text-stone-600 p-6 rounded-2xl font-bold hover:bg-stone-100 transition-all disabled:opacity-50 text-center"
           >
-            <Dice5 className="w-5 h-5" />
-            Randomize Order
+            <Layers className="w-6 h-6 mb-1 text-blue-500" />
+            <div className="text-stone-900">Clear All Scores</div>
+            <div className="text-[10px] font-normal text-stone-400">Resets points to zero but keeps season</div>
           </button>
+
           <button 
             onClick={toggleRankings}
-            className={`flex items-center justify-center gap-2 p-4 rounded-xl font-bold transition-all min-h-[44px] ${
-              config?.rankingsOpen ? 'bg-orange-100 text-orange-600 hover:bg-orange-200' : 'bg-stone-100 text-stone-400 hover:bg-stone-200'
+            className={`flex flex-col items-center justify-center gap-2 p-6 rounded-2xl font-bold transition-all border text-center ${
+              config?.rankingsOpen 
+                ? 'bg-orange-50 border-orange-200 text-orange-600 hover:bg-orange-100' 
+                : 'bg-stone-50 border-stone-200 text-stone-400 hover:bg-stone-100'
             }`}
           >
-            <ListOrdered className="w-5 h-5" />
-            {config?.rankingsOpen ? 'Close Rankings' : 'Open Rankings'}
+            <ListOrdered className="w-6 h-6 mb-1" />
+            <div className="text-stone-900">{config?.rankingsOpen ? 'Close Rankings' : 'Open Rankings'}</div>
+            <div className="text-[10px] font-normal text-stone-400">{config?.rankingsOpen ? 'Rankings are currently COLLECTING' : 'Rankings are currently CLOSED'}</div>
           </button>
-          <button 
-            onClick={onAutoDraft}
-            disabled={isSubmittingApp || config?.draftCompleted || !config?.draftStarted}
-            className="flex items-center justify-center gap-2 bg-stone-900 text-white p-4 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50 min-h-[44px]"
-          >
-            <Zap className="w-5 h-5" />
-            Auto-Draft Next
-          </button>
-          <button 
-            onClick={onFullAutoDraft}
-            disabled={isSubmittingApp || config?.draftCompleted}
-            className="flex items-center justify-center gap-2 bg-orange-600 text-white p-4 rounded-xl font-bold hover:bg-orange-700 transition-all disabled:opacity-50 min-h-[44px]"
-          >
-            <Zap className="w-5 h-5" />
-            Run Full Auto-Draft
-          </button>
+
+          <div className="flex flex-col gap-2">
+            <button 
+              onClick={onAutoDraft}
+              disabled={isSubmittingApp || config?.draftCompleted || !config?.draftStarted}
+              className="flex items-center justify-center gap-3 bg-stone-900 text-white p-4 h-1/2 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50"
+            >
+              <Zap className="w-5 h-5" />
+              Auto-Draft Next
+            </button>
+            <button 
+              onClick={onFullAutoDraft}
+              disabled={isSubmittingApp || config?.draftCompleted}
+              className="flex items-center justify-center gap-3 bg-orange-600 text-white p-4 h-1/2 rounded-xl font-bold hover:bg-orange-700 transition-all disabled:opacity-50"
+            >
+              <Shield className="w-5 h-5" />
+              Run Full Auto-Draft
+            </button>
+          </div>
         </div>
       </div>
 
@@ -4072,18 +5410,20 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
             <option key={p.id} value={p.id}>{p.name} {p.email ? `(${p.email})` : '(Not Logged In)'}</option>
           ))}
         </select>
-
-        {proxyPlayer && (
-          <div className="border-t border-stone-100 pt-6">
-            <RankingView 
-              chefs={chefs} 
-              player={proxyPlayer} 
-              players={players}
-              config={config}
-              isAdmin={true}
-            />
-          </div>
-        )}
+        {(() => {
+          const proxyPlayer = players.find(p => p.id === proxyPlayerId);
+          return proxyPlayer ? (
+            <div className="border-t border-stone-100 pt-6">
+              <RankingView 
+                chefs={chefs} 
+                player={proxyPlayer} 
+                players={players}
+                config={config}
+                isAdmin={true}
+              />
+            </div>
+          ) : null;
+        })()}
       </div>
 
       <div className="bg-white rounded-2xl border border-stone-200 p-4 sm:p-8 shadow-sm">
@@ -4168,17 +5508,12 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
           </div>
           <button 
             onClick={handleMergePlayers}
-            disabled={!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId || isSubmitting}
+            disabled={!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId || isLocked}
             className="bg-stone-900 text-white p-3 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50 min-h-[44px]"
           >
             Merge Players
           </button>
         </div>
-      </div>
-
-      <div className="bg-white rounded-2xl border border-stone-200 p-4 sm:p-8 shadow-sm">
-        <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Scoring Scraper (Beta)</h2>
-        <ScraperTool chefs={chefs} players={players} showStatus={showStatus} />
       </div>
 
       <div className="bg-white rounded-2xl border border-stone-200 p-4 sm:p-8 shadow-sm">
@@ -4220,10 +5555,10 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
           </div>
           <button 
             onClick={handleAddScore}
-            disabled={!selectedChefId || isSubmitting}
+            disabled={!selectedChefId || isLocked}
             className="bg-stone-900 text-white p-3 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50 min-h-[44px]"
           >
-            {isSubmitting ? 'Updating...' : 'Add Points'}
+            {isAdminSubmitting ? 'Updating...' : 'Add Points'}
           </button>
         </div>
       </div>
@@ -4242,7 +5577,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
           />
           <button 
             onClick={handleBulkRename}
-            disabled={isSubmitting || !bulkNames.trim()}
+            disabled={isLocked || !bulkNames.trim()}
             className="w-full bg-stone-900 text-white p-3 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50 min-h-[44px]"
           >
             Apply Bulk Names
@@ -4311,36 +5646,6 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
         </div>
       </div>
 
-      <div className="bg-stone-50 border border-stone-200 rounded-2xl p-6 sm:p-8 text-center space-y-4">
-        <RefreshCw className="w-10 h-10 sm:w-12 sm:h-12 text-stone-400 mx-auto" />
-        <h3 className="text-lg sm:text-xl font-bold">League Management</h3>
-        
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
-          <div className="p-4 bg-white rounded-xl border border-stone-200 space-y-3">
-            <h4 className="font-bold text-stone-900">Clear Scores</h4>
-            <p className="text-stone-500 text-xs">Removes all score events and resets everyone to 0 points. Keeps players and drafts intact.</p>
-            <button 
-              onClick={handleClearScores} 
-              disabled={isSubmitting}
-              className="w-full bg-orange-100 text-orange-800 px-4 py-2 rounded-lg font-bold hover:bg-orange-200 transition-all text-sm disabled:opacity-50"
-            >
-              Clear All Scores
-            </button>
-          </div>
-          
-          <div className="p-4 bg-white rounded-xl border border-stone-200 space-y-3">
-            <h4 className="font-bold text-stone-900">Hard Reset</h4>
-            <p className="text-stone-500 text-xs">Deletes EVERYTHING (players, drafts, scores) and re-seeds the initial chefs.</p>
-            <button 
-              onClick={seedData} 
-              disabled={isSubmitting}
-              className="w-full bg-red-100 text-red-800 px-4 py-2 rounded-lg font-bold hover:bg-red-200 transition-all text-sm disabled:opacity-50"
-            >
-              {chefs.length === 0 ? 'Seed League Data' : 'Reset & Re-Seed League'}
-            </button>
-          </div>
-        </div>
-      </div>
     </div>
   );
 }

@@ -23,7 +23,7 @@ async function startServer() {
       console.log(`Proxying request to: ${targetUrl}`);
       const response = await fetch(targetUrl, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'TopChefFantasyLeagueBot/1.1 (https://ais-pre-2ujt7kexusvm2mwfd33joa-256349775206.us-east1.run.app; contact: GarrettLMiller@gmail.com) node-fetch/1.0',
           'Accept': 'application/json, text/plain, */*'
         }
       });
