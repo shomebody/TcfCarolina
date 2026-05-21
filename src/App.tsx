@@ -19,6 +19,7 @@ import {
   serverTimestamp,
   increment,
   runTransaction,
+  writeBatch,
   getDocFromServer,
   where,
   limit
@@ -4537,6 +4538,23 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
   const [scoringStartWeek, setScoringStartWeek] = useState<number>(config?.scoringStartWeek || 1);
   const [showDraftOrderEditor, setShowDraftOrderEditor] = useState(false);
   const [editedDraftOrder, setEditedDraftOrder] = useState<string[]>(config?.draftOrder || []);
+  const [auditResult, setAuditResult] = useState<null | {
+    drift: { name: string; stored: number; summed: number; delta: number }[];
+    duplicates: { chefName: string; week: number; type: string; count: number }[];
+    unknownTypes: { chefName: string; week: number; type: string; points: number }[];
+    statusIssues: { chefName: string; issue: string }[];
+    eventCount: number;
+    chefCount: number;
+  }>(null);
+  const [repairResult, setRepairResult] = useState<null | {
+    addedEvents: number; skippedEvents: number;
+    statusChanges: number; statusSkipped: number;
+    renamedEvents: number;
+    log: string[];
+  }>(null);
+  const [recomputeResult, setRecomputeResult] = useState<null | {
+    chefsUpdated: number; playersUpdated: number; log: string[];
+  }>(null);
 
   useEffect(() => {
     if (config?.draftOrder) {
@@ -4626,6 +4644,226 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
 
   const updateChefName = async (id: string, name: string) => {
     await updateDoc(doc(db, 'chefs', id), { name });
+  };
+
+  // === Live audit: read-only consistency check vs canonical scoreEvents ===
+  const runLiveAudit = async () => {
+    if (isLocked) return;
+    setIsAdminSubmitting(true);
+    try {
+      const eventsSnap = await getDocs(collection(db, 'scoreEvents'));
+      const events = eventsSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+      const known = new Set(SCORING_RULES.map(r => r.type));
+
+      const sums = new Map<string, number>();
+      for (const e of events) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
+      const drift = chefs
+        .map(c => ({ name: c.name, stored: c.totalScore ?? 0, summed: sums.get(c.id) ?? 0 }))
+        .filter(d => d.stored !== d.summed)
+        .map(d => ({ ...d, delta: d.stored - d.summed }));
+
+      const triple = new Map<string, any[]>();
+      for (const e of events) {
+        const k = `${e.chefId}|${e.week}|${e.type}`;
+        if (!triple.has(k)) triple.set(k, []);
+        triple.get(k)!.push(e);
+      }
+      const duplicates: { chefName: string; week: number; type: string; count: number }[] = [];
+      for (const [k, evs] of triple) {
+        if (evs.length > 1) {
+          const [chefId, week, type] = k.split('|');
+          duplicates.push({
+            chefName: chefs.find(c => c.id === chefId)?.name ?? '(unknown)',
+            week: Number(week),
+            type,
+            count: evs.length,
+          });
+        }
+      }
+
+      const unknownTypes = events
+        .filter(e => !known.has(e.type))
+        .map(e => ({
+          chefName: chefs.find(c => c.id === e.chefId)?.name ?? '(unknown)',
+          week: e.week,
+          type: e.type,
+          points: e.points,
+        }));
+
+      const statusByChef = new Map(chefs.map(c => [c.id, c.status]));
+      const statusIssues: { chefName: string; issue: string }[] = [];
+      for (const e of events) {
+        if (e.type === 'Eliminated' && statusByChef.get(e.chefId) === 'active') {
+          statusIssues.push({
+            chefName: chefs.find(c => c.id === e.chefId)?.name ?? '(unknown)',
+            issue: `Has Eliminated event (W${e.week}) but status is "active"`,
+          });
+        }
+      }
+
+      setAuditResult({
+        drift,
+        duplicates,
+        unknownTypes,
+        statusIssues,
+        eventCount: events.length,
+        chefCount: chefs.length,
+      });
+      showStatus('success', `Audit complete: ${events.length} events across ${chefs.length} chefs.`);
+    } catch (error) {
+      console.error(error);
+      showStatus('error', 'Audit failed. Check console.');
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  // === One-time idempotent Season 22 repair ===
+  // Adds events Wikipedia/LCK reveals were missing from Firestore, fixes 4 chef
+  // statuses, and renames legacy "Top"/"Bottom" event types to the canonical
+  // "Judges Table Top"/"Judges Table Bottom". Safe to click multiple times.
+  const SEASON_22_MISSING_EVENTS = [
+    { chefName: 'Sieger Bayer', week: 4, type: 'Episode Sweep Bonus', note: 'sweep credited to total but no event row existed' },
+    { chefName: 'Anthony Jones', week: 7, type: 'Episode Sweep Bonus', note: 'sweep credited to total but no event row existed' },
+    { chefName: 'Anthony Jones', week: 10, type: 'Judges Table Top', note: 'HIGH in wiki W10' },
+    { chefName: 'Anthony Jones', week: 11, type: 'Eliminated', note: 'OUT in wiki W11' },
+    { chefName: 'Duyen Ha', week: 10, type: 'Eliminated', note: 'OUT in wiki W10' },
+    { chefName: 'Jennifer Lee Jackson', week: 8, type: 'Eliminated', note: 'medical removal W8' },
+    { chefName: 'Nana Araba Wilmot', week: 4, type: 'Last Chance Kitchen Win', note: 'LCK Ep 1 vs Brittany' },
+    { chefName: 'Rhoda Magbitang', week: 5, type: 'Last Chance Kitchen Win', note: 'LCK Ep 2 vs Nana' },
+    { chefName: 'Rhoda Magbitang', week: 7, type: 'Last Chance Kitchen Win', note: 'LCK Ep 4 vs Justin' },
+    { chefName: 'Rhoda Magbitang', week: 8, type: 'Last Chance Kitchen Win', note: 'LCK Ep 5 vs Brandon (returned W9)' },
+  ];
+  const SEASON_22_STATUS_FIXES: { chefName: string; status: 'active' | 'eliminated' | 'lck' }[] = [
+    { chefName: 'Sieger Bayer', status: 'active' },
+    { chefName: 'Rhoda Magbitang', status: 'active' },
+    { chefName: 'Anthony Jones', status: 'eliminated' },
+    { chefName: 'Duyen Ha', status: 'eliminated' },
+  ];
+  const SEASON_22_TYPE_RENAMES: Record<string, string> = {
+    'Top': 'Judges Table Top',
+    'Bottom': 'Judges Table Bottom',
+  };
+
+  const applySeasonRepair = async () => {
+    if (isLocked) return;
+    setIsAdminSubmitting(true);
+    const log: string[] = [];
+    let addedEvents = 0, skippedEvents = 0, statusChanges = 0, statusSkipped = 0, renamedEvents = 0;
+    try {
+      const eventsSnap = await getDocs(collection(db, 'scoreEvents'));
+      const events = eventsSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+
+      // 1. Add missing events (idempotent: skip if (chefId, week, type) already exists)
+      for (const m of SEASON_22_MISSING_EVENTS) {
+        const chef = chefs.find(c => c.name === m.chefName);
+        if (!chef) { log.push(`SKIP: chef "${m.chefName}" not found`); skippedEvents++; continue; }
+        const rule = SCORING_RULES.find(r => r.type === m.type);
+        if (!rule) { log.push(`SKIP: type "${m.type}" not in SCORING_RULES`); skippedEvents++; continue; }
+        const exists = events.some(e => e.chefId === chef.id && e.week === m.week && e.type === m.type);
+        if (exists) { log.push(`SKIP (already exists): ${chef.name} W${m.week} ${m.type}`); skippedEvents++; continue; }
+        await addDoc(collection(db, 'scoreEvents'), {
+          chefId: chef.id,
+          week: m.week,
+          type: m.type,
+          points: rule.points,
+          description: `${m.type} - Week ${m.week} (${m.note})`,
+          timestamp: serverTimestamp(),
+        });
+        log.push(`ADDED: ${chef.name} W${m.week} ${m.type} (${rule.points > 0 ? '+' : ''}${rule.points})`);
+        addedEvents++;
+      }
+
+      // 2. Status corrections (idempotent: setting same value is fine)
+      for (const s of SEASON_22_STATUS_FIXES) {
+        const chef = chefs.find(c => c.name === s.chefName);
+        if (!chef) { log.push(`SKIP STATUS: chef "${s.chefName}" not found`); statusSkipped++; continue; }
+        if (chef.status === s.status) { log.push(`SKIP STATUS (already ${s.status}): ${chef.name}`); statusSkipped++; continue; }
+        await updateDoc(doc(db, 'chefs', chef.id), { status: s.status });
+        log.push(`STATUS: ${chef.name} ${chef.status} -> ${s.status}`);
+        statusChanges++;
+      }
+
+      // 3. Type renames (idempotent: only changes events still using the legacy type)
+      const refreshedSnap = await getDocs(collection(db, 'scoreEvents'));
+      const refreshed = refreshedSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+      const renameTargets = refreshed.filter(e => SEASON_22_TYPE_RENAMES[e.type]);
+      if (renameTargets.length > 0) {
+        const batch = writeBatch(db);
+        for (const e of renameTargets) {
+          const newType = SEASON_22_TYPE_RENAMES[e.type];
+          batch.update(doc(db, 'scoreEvents', e.id), {
+            type: newType,
+            description: `${newType} - Week ${e.week}`,
+          });
+          renamedEvents++;
+        }
+        await batch.commit();
+        log.push(`RENAMED ${renamedEvents} events ("Top"/"Bottom" -> canonical labels)`);
+      } else {
+        log.push(`SKIP RENAMES: no legacy "Top"/"Bottom" events remain`);
+      }
+
+      setRepairResult({ addedEvents, skippedEvents, statusChanges, statusSkipped, renamedEvents, log });
+      showStatus('success', `Repair done: +${addedEvents} events, ${statusChanges} status fixes, ${renamedEvents} renames. Now click Recompute Totals.`);
+    } catch (error: any) {
+      console.error(error);
+      log.push(`ERROR: ${error?.message || error}`);
+      setRepairResult({ addedEvents, skippedEvents, statusChanges, statusSkipped, renamedEvents, log });
+      showStatus('error', 'Repair partially failed. Check the log below.');
+    } finally {
+      setIsAdminSubmitting(false);
+    }
+  };
+
+  // === Recompute cached totals from canonical scoreEvents (idempotent, safe) ===
+  const recomputeTotals = async () => {
+    if (isLocked) return;
+    setIsAdminSubmitting(true);
+    const log: string[] = [];
+    let chefsUpdated = 0, playersUpdated = 0;
+    try {
+      const eventsSnap = await getDocs(collection(db, 'scoreEvents'));
+      const events = eventsSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+      const sums = new Map<string, number>();
+      for (const e of events) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
+
+      const chefBatch = writeBatch(db);
+      for (const c of chefs) {
+        const target = sums.get(c.id) ?? 0;
+        const current = c.totalScore ?? 0;
+        if (target !== current) {
+          chefBatch.update(doc(db, 'chefs', c.id), { totalScore: target });
+          log.push(`CHEF: ${c.name} ${current} -> ${target}`);
+          chefsUpdated++;
+        }
+      }
+      if (chefsUpdated > 0) await chefBatch.commit();
+
+      // Re-derive player totals from the just-updated chef sums (use sums map, not stale cache).
+      const playerBatch = writeBatch(db);
+      for (const p of players) {
+        const target = (p.chefIds || []).reduce((s, cid) => s + (sums.get(cid) ?? 0), 0);
+        const current = p.totalScore ?? 0;
+        if (target !== current) {
+          playerBatch.update(doc(db, 'players', p.id), { totalScore: target });
+          log.push(`PLAYER: ${p.name} ${current} -> ${target}`);
+          playersUpdated++;
+        }
+      }
+      if (playersUpdated > 0) await playerBatch.commit();
+
+      if (chefsUpdated === 0 && playersUpdated === 0) log.push('No drift detected. All totals already match.');
+      setRecomputeResult({ chefsUpdated, playersUpdated, log });
+      showStatus('success', `Recompute done: ${chefsUpdated} chef totals, ${playersUpdated} player totals updated.`);
+    } catch (error: any) {
+      console.error(error);
+      log.push(`ERROR: ${error?.message || error}`);
+      setRecomputeResult({ chefsUpdated, playersUpdated, log });
+      showStatus('error', 'Recompute failed. Check the log below.');
+    } finally {
+      setIsAdminSubmitting(false);
+    }
   };
 
   const toggleRankings = async () => {
@@ -5553,7 +5791,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
               className="w-full p-3 bg-stone-50 border border-stone-200 rounded-xl focus:ring-2 focus:ring-orange-500 outline-none min-h-[44px]"
             />
           </div>
-          <button 
+          <button
             onClick={handleAddScore}
             disabled={!selectedChefId || isLocked}
             className="bg-stone-900 text-white p-3 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50 min-h-[44px]"
@@ -5561,6 +5799,124 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
             {isAdminSubmitting ? 'Updating...' : 'Add Points'}
           </button>
         </div>
+      </div>
+
+      <div className="bg-white rounded-2xl border border-stone-200 p-4 sm:p-8 shadow-sm">
+        <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6 flex items-center gap-2">
+          <ShieldCheck className="w-5 h-5 text-orange-600" />
+          Scoring Integrity Tools
+        </h2>
+        <p className="text-xs text-stone-500 mb-4">
+          Three small tools that work together. Run them in order: Audit (see what's wrong) &rarr; Apply Repair (fix the known S22 gaps) &rarr; Recompute Totals (realign cached totals from the canonical event log). All are safe to run multiple times.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+          <button
+            onClick={runLiveAudit}
+            disabled={isLocked}
+            className="flex items-center justify-center gap-2 bg-stone-100 text-stone-700 px-4 py-3 rounded-xl font-bold hover:bg-stone-200 transition-all disabled:opacity-50 min-h-[48px]"
+          >
+            <BarChart3 className="w-4 h-4" />
+            1. Audit Live Data
+          </button>
+          <button
+            onClick={applySeasonRepair}
+            disabled={isLocked}
+            className="flex items-center justify-center gap-2 bg-orange-600 text-white px-4 py-3 rounded-xl font-bold hover:bg-orange-700 transition-all disabled:opacity-50 min-h-[48px]"
+          >
+            <ShieldCheck className="w-4 h-4" />
+            2. Apply Season 22 Repair
+          </button>
+          <button
+            onClick={recomputeTotals}
+            disabled={isLocked}
+            className="flex items-center justify-center gap-2 bg-stone-900 text-white px-4 py-3 rounded-xl font-bold hover:bg-stone-800 transition-all disabled:opacity-50 min-h-[48px]"
+          >
+            <RefreshCw className="w-4 h-4" />
+            3. Recompute Totals
+          </button>
+        </div>
+
+        {auditResult && (
+          <div className="mb-4 p-4 bg-stone-50 border border-stone-200 rounded-xl text-xs space-y-2">
+            <div className="font-bold text-stone-700 text-sm">Audit Result</div>
+            <div className="text-stone-500">
+              {auditResult.eventCount} score events across {auditResult.chefCount} chefs.
+            </div>
+            <div className={auditResult.drift.length === 0 ? 'text-green-700' : 'text-red-700 font-bold'}>
+              {auditResult.drift.length === 0
+                ? '✓ All chef totals match the sum of their events.'
+                : `⚠ ${auditResult.drift.length} chef(s) with drift:`}
+            </div>
+            {auditResult.drift.map((d, i) => (
+              <div key={i} className="ml-4 text-red-700">
+                &middot; {d.name}: stored {d.stored}, sum of events {d.summed} (delta {d.delta > 0 ? '+' : ''}{d.delta})
+              </div>
+            ))}
+            <div className={auditResult.duplicates.length === 0 ? 'text-green-700' : 'text-red-700 font-bold'}>
+              {auditResult.duplicates.length === 0
+                ? '✓ No duplicate (chef, week, type) events.'
+                : `⚠ ${auditResult.duplicates.length} duplicate group(s):`}
+            </div>
+            {auditResult.duplicates.map((d, i) => (
+              <div key={i} className="ml-4 text-red-700">&middot; {d.chefName} W{d.week} {d.type} x{d.count}</div>
+            ))}
+            <div className={auditResult.unknownTypes.length === 0 ? 'text-green-700' : 'text-orange-700 font-bold'}>
+              {auditResult.unknownTypes.length === 0
+                ? '✓ All event types match SCORING_RULES.'
+                : `⚠ ${auditResult.unknownTypes.length} event(s) with non-canonical type (e.g. "Top"/"Bottom" instead of "Judges Table Top"/"Judges Table Bottom"). The Apply Repair button will fix these.`}
+            </div>
+            <div className={auditResult.statusIssues.length === 0 ? 'text-green-700' : 'text-orange-700 font-bold'}>
+              {auditResult.statusIssues.length === 0
+                ? '✓ No status/event contradictions.'
+                : `⚠ ${auditResult.statusIssues.length} status issue(s):`}
+            </div>
+            {auditResult.statusIssues.map((s, i) => (
+              <div key={i} className="ml-4 text-orange-700">&middot; {s.chefName}: {s.issue}</div>
+            ))}
+          </div>
+        )}
+
+        {repairResult && (
+          <div className="mb-4 p-4 bg-orange-50 border border-orange-200 rounded-xl text-xs space-y-2">
+            <div className="font-bold text-stone-700 text-sm">Season 22 Repair Result</div>
+            <div className="text-stone-600">
+              Events added: <span className="font-bold">{repairResult.addedEvents}</span> &middot;
+              skipped (already existed): <span className="font-bold">{repairResult.skippedEvents}</span> &middot;
+              status changes: <span className="font-bold">{repairResult.statusChanges}</span> &middot;
+              status no-ops: <span className="font-bold">{repairResult.statusSkipped}</span> &middot;
+              renamed: <span className="font-bold">{repairResult.renamedEvents}</span>
+            </div>
+            <details className="cursor-pointer">
+              <summary className="font-bold text-stone-500">Show detailed log</summary>
+              <div className="mt-2 max-h-48 overflow-y-auto font-mono text-[10px] text-stone-600 space-y-0.5">
+                {repairResult.log.map((line, i) => <div key={i}>{line}</div>)}
+              </div>
+            </details>
+            <div className="text-stone-500 italic">
+              Next step: click <strong>3. Recompute Totals</strong> to realign chef and player totals.
+            </div>
+          </div>
+        )}
+
+        {recomputeResult && (
+          <div className="p-4 bg-stone-50 border border-stone-200 rounded-xl text-xs space-y-2">
+            <div className="font-bold text-stone-700 text-sm">Recompute Result</div>
+            <div className="text-stone-600">
+              Chef totals updated: <span className="font-bold">{recomputeResult.chefsUpdated}</span> &middot;
+              Player totals updated: <span className="font-bold">{recomputeResult.playersUpdated}</span>
+            </div>
+            <details className="cursor-pointer">
+              <summary className="font-bold text-stone-500">Show detailed log</summary>
+              <div className="mt-2 max-h-48 overflow-y-auto font-mono text-[10px] text-stone-600 space-y-0.5">
+                {recomputeResult.log.map((line, i) => <div key={i}>{line}</div>)}
+              </div>
+            </details>
+            <div className="text-stone-500 italic">
+              Now click <strong>1. Audit Live Data</strong> again. Everything should report &#10003;.
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="bg-white rounded-2xl border border-stone-200 p-4 sm:p-8 shadow-sm">
