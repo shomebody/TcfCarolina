@@ -4654,9 +4654,14 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
       const eventsSnap = await getDocs(collection(db, 'scoreEvents'));
       const events = eventsSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
       const known = new Set(SCORING_RULES.map(r => r.type));
+      const startWeek = config?.scoringStartWeek ?? 1;
 
+      // Drift compares stored chef.totalScore against the sum of events from
+      // scoringStartWeek onward — earlier weeks are intentionally excluded.
       const sums = new Map<string, number>();
-      for (const e of events) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
+      for (const e of events) {
+        if (e.week >= startWeek) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
+      }
       const drift = chefs
         .map(c => ({ name: c.name, stored: c.totalScore ?? 0, summed: sums.get(c.id) ?? 0 }))
         .filter(d => d.stored !== d.summed)
@@ -4709,7 +4714,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
         eventCount: events.length,
         chefCount: chefs.length,
       });
-      showStatus('success', `Audit complete: ${events.length} events across ${chefs.length} chefs.`);
+      showStatus('success', `Audit complete: ${events.length} events across ${chefs.length} chefs (scoring from week ${startWeek}).`);
     } catch (error) {
       console.error(error);
       showStatus('error', 'Audit failed. Check console.');
@@ -4817,6 +4822,9 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
   };
 
   // === Recompute cached totals from canonical scoreEvents (idempotent, safe) ===
+  // Respects config.scoringStartWeek — events earlier than that week are NOT
+  // counted toward chef/player totals (intentional league rule, e.g. ignoring
+  // the season premiere).
   const recomputeTotals = async () => {
     if (isLocked) return;
     setIsAdminSubmitting(true);
@@ -4825,8 +4833,12 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
     try {
       const eventsSnap = await getDocs(collection(db, 'scoreEvents'));
       const events = eventsSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+      const startWeek = config?.scoringStartWeek ?? 1;
+      log.push(`Scoring from week ${startWeek} onward (config.scoringStartWeek).`);
       const sums = new Map<string, number>();
-      for (const e of events) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
+      for (const e of events) {
+        if (e.week >= startWeek) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
+      }
 
       const chefBatch = writeBatch(db);
       for (const c of chefs) {
@@ -5841,7 +5853,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
           <div className="mb-4 p-4 bg-stone-50 border border-stone-200 rounded-xl text-xs space-y-2">
             <div className="font-bold text-stone-700 text-sm">Audit Result</div>
             <div className="text-stone-500">
-              {auditResult.eventCount} score events across {auditResult.chefCount} chefs.
+              {auditResult.eventCount} score events across {auditResult.chefCount} chefs. Scoring from week {config?.scoringStartWeek ?? 1} onward.
             </div>
             <div className={auditResult.drift.length === 0 ? 'text-green-700' : 'text-red-700 font-bold'}>
               {auditResult.drift.length === 0

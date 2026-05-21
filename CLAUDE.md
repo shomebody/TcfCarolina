@@ -80,7 +80,7 @@ The entire React app lives in **one file**: `src/App.tsx` (5,651 lines). **Do no
 
 **`scoreEvents` is canonical. `chef.totalScore` and `player.totalScore` are derived caches.**
 
-> For every chef: `chef.totalScore` MUST equal the sum of `event.points` across all `scoreEvents` with `event.chefId === chef.id`. If they ever drift, the caches are wrong, not the events.
+> For every chef: `chef.totalScore` MUST equal the sum of `event.points` across all `scoreEvents` with `event.chefId === chef.id` **AND `event.week >= config.scoringStartWeek`**. Events before `scoringStartWeek` exist in the database but intentionally don't count toward totals. For S22, `scoringStartWeek = 2` (W1 events are ignored). If totals drift from this sum, the caches are wrong, not the events.
 
 > For every player: `player.totalScore` MUST equal the sum of `chef.totalScore` for each `chefId` in `player.chefIds`. The live UI recomputes this at render time (`src/App.tsx:488` or thereabouts), so a drift in `player.totalScore` won't visibly break the scoreboard but indicates a bug somewhere.
 

@@ -74,9 +74,11 @@ const SCORING_RULES = new Map([
 ]);
 
 // --- Drift: chef.totalScore vs sum of scoreEvents.points ---
+// Respects config.league.scoringStartWeek (events before this week don't count).
+const startWeek = configLeague?.scoringStartWeek ?? 1;
 const chefSums = new Map();
 for (const ev of scoreEvents) {
-  chefSums.set(ev.chefId, (chefSums.get(ev.chefId) || 0) + (ev.points || 0));
+  if (ev.week >= startWeek) chefSums.set(ev.chefId, (chefSums.get(ev.chefId) || 0) + (ev.points || 0));
 }
 const chefDrift = [];
 for (const chef of chefs) {
@@ -187,6 +189,7 @@ md.push(`- Chefs: **${chefs.length}**`);
 md.push(`- Players: **${players.length}**`);
 md.push(`- Score events: **${scoreEvents.length}**`);
 md.push(`- Weeks with events: **${weeks.length}** (${weeks.join(', ') || 'none'})`);
+md.push(`- **scoringStartWeek:** \`${startWeek}\` (events before week ${startWeek} don't count toward chef totals)`);
 md.push(`- config/league: ${configLeague ? 'present' : '⚠️ MISSING'}`);
 md.push(`- config/season: ${configSeason ? 'present' : 'absent (acceptable)'}\n`);
 
