@@ -4596,12 +4596,29 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
 
   const handleAddScore = async () => {
     if (!selectedChefId || isLocked) return;
-    setIsAdminSubmitting(true);
 
     const rule = SCORING_RULES.find(r => r.type === selectedType);
     if (!rule) return;
 
+    setIsAdminSubmitting(true);
+
     try {
+      // Duplicate guard: reject if an event with the same (chef, week, type)
+      // already exists. The admin must delete the existing event first.
+      const dupSnap = await getDocs(query(
+        collection(db, 'scoreEvents'),
+        where('chefId', '==', selectedChefId),
+        where('week', '==', week),
+        where('type', '==', selectedType),
+        limit(1),
+      ));
+      if (!dupSnap.empty) {
+        const chefName = chefs.find(c => c.id === selectedChefId)?.name ?? 'this chef';
+        showStatus('error', `"${selectedType}" already exists for ${chefName} in Week ${week}. Delete the existing entry from Score History first.`);
+        setIsAdminSubmitting(false);
+        return;
+      }
+
       await runTransaction(db, async (transaction) => {
         // Add Score Event
         const eventRef = doc(collection(db, 'scoreEvents'));
@@ -4614,13 +4631,24 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
           description: `${selectedType} - Week ${week}`
         });
 
-        // Update Chef Score
+        // Update Chef Score. Status only changes for events that *imply* a
+        // status change. Retroactive Top/Bottom/Quickfire events on an
+        // already-eliminated chef must NOT resurrect them.
         const chefRef = doc(db, 'chefs', selectedChefId);
         const startWeek = config?.scoringStartWeek ?? 1;
-        transaction.update(chefRef, {
+        const updates: { totalScore: any; status?: 'active' | 'eliminated' | 'lck' } = {
           totalScore: increment(week >= startWeek ? rule.points : 0),
-          status: selectedType === 'Eliminated' ? 'eliminated' : 'active'
-        });
+        };
+        if (selectedType === 'Eliminated') {
+          updates.status = 'eliminated';
+        } else if (
+          selectedType === 'Last Chance Kitchen Win' ||
+          selectedType === 'Winning Top Chef' ||
+          selectedType === 'Making Season Finale'
+        ) {
+          updates.status = 'active';
+        }
+        transaction.update(chefRef, updates);
 
         // Update Player Score (if chef is owned)
         if (week >= startWeek) {
@@ -5058,297 +5086,6 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
     }
   };
 
-  const applyChelseaPicks = async () => {
-    setIsAdminSubmitting(true);
-    try {
-      const chelsea = players.find(p => p.name.toLowerCase().includes('chelsea'));
-      if (!chelsea) {
-        showStatus('error', "Could not find a player named Chelsea.");
-        return;
-      }
-      const findChefId = (namePart: string) => {
-        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
-        return chef ? chef.id : null;
-      };
-
-      const picks = [
-        findChefId("Laurence Louie"),
-        findChefId("Jonathan Dearden"),
-        findChefId("Brandon Dearden"),
-        findChefId("Rhoda Mag"),
-        findChefId("Brittany Coch"),
-        findChefId("Oscar Dia"),
-        findChefId("Sieger Bayer"),
-        findChefId("Sherry Cardo"),
-        findChefId("Duyen Ha"),
-        findChefId("Jassi"),
-        findChefId("Jennifer Lee"),
-        findChefId("Justin Tootla"),
-        findChefId("Anthony Jones"), // Put at bottom
-        findChefId("Nana Arab") // Put at bottom
-      ].filter(id => id !== null) as string[];
-
-      // Make sure we have 14 picks
-      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
-      const finalPicks = [...picks, ...remainingIds];
-
-      await updateDoc(doc(db, 'players', chelsea.id), { rankings: finalPicks });
-      showStatus('success', "Applied Chelsea's picks successfully!");
-    } catch (e: any) {
-      console.error(e);
-      showStatus('error', "Failed to apply picks: " + e.message);
-    } finally {
-      setIsAdminSubmitting(false);
-    }
-  };
-
-  const applyChrisPicks = async () => {
-    setIsAdminSubmitting(true);
-    try {
-      const chris = players.find(p => p.name.toLowerCase().includes('chris'));
-      if (!chris) {
-        showStatus('error', "Could not find a player named Chris.");
-        return;
-      }
-      const findChefId = (namePart: string) => {
-        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
-        return chef ? chef.id : null;
-      };
-
-      const picks = [
-        findChefId("Anthony Jones"),
-        findChefId("Jassi"),
-        findChefId("Nana Arab"),
-        findChefId("Sieger Bayer"),
-        findChefId("Jennifer Lee"),
-        findChefId("Sherry Cardo"),
-        findChefId("Brittany Coch"),
-        findChefId("Laurence Louie"),
-        findChefId("Jonathan Dearden"),
-        findChefId("Justin Tootla"),
-        findChefId("Brandon Dearden"),
-        findChefId("Duyen Ha"),
-      ].filter(id => id !== null) as string[];
-
-      // Make sure we have 14 picks
-      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
-      const finalPicks = [...picks, ...remainingIds];
-
-      await updateDoc(doc(db, 'players', chris.id), { rankings: finalPicks });
-      showStatus('success', "Applied Chris's picks successfully!");
-    } catch (e: any) {
-      console.error(e);
-      showStatus('error', "Failed to apply picks: " + e.message);
-    } finally {
-      setIsAdminSubmitting(false);
-    }
-  };
-
-  const applyShanePicks = async () => {
-    setIsAdminSubmitting(true);
-    try {
-      const shane = players.find(p => p.name.toLowerCase().includes('shane'));
-      if (!shane) {
-        showStatus('error', "Could not find a player named Shane.");
-        return;
-      }
-      const findChefId = (namePart: string) => {
-        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
-        return chef ? chef.id : null;
-      };
-
-      const picks = [
-        findChefId("Rhoda"),
-        findChefId("Duyen"),
-        findChefId("Anthony"),
-        findChefId("Jassi"),
-        findChefId("Sherry"),
-        findChefId("Jennifer"),
-        findChefId("Oscar"),
-        findChefId("Nana"),
-        findChefId("Jonathan"),
-        findChefId("Brandon"),
-        findChefId("Sieger"),
-        findChefId("Justin"),
-        findChefId("Laurence"),
-        findChefId("Brittany Coch"),
-      ].filter(id => id !== null) as string[];
-
-      // Make sure we have 14 picks
-      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
-      const finalPicks = [...picks, ...remainingIds];
-
-      await updateDoc(doc(db, 'players', shane.id), { rankings: finalPicks });
-      showStatus('success', "Applied Shane's picks successfully!");
-    } catch (e: any) {
-      console.error(e);
-      showStatus('error', "Failed to apply picks: " + e.message);
-    } finally {
-      setIsAdminSubmitting(false);
-    }
-  };
-
-  const applyLoriPicks = async () => {
-    setIsAdminSubmitting(true);
-    try {
-      const lori = players.find(p => p.name.toLowerCase().includes('lori'));
-      if (!lori) {
-        showStatus('error', "Could not find a player named Lori.");
-        return;
-      }
-      const findChefId = (namePart: string) => {
-        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
-        return chef ? chef.id : null;
-      };
-
-      const picks = [
-        findChefId("Duyen Ha"),
-        findChefId("Brandon Dearden"),
-        findChefId("Laurence Louie"),
-        findChefId("Sherry Cardoso"),
-        findChefId("Sieger Bayer"),
-        findChefId("Rhoda Mag"),
-        findChefId("Anthony Jones"),
-        findChefId("Jonathan Dearden"),
-        findChefId("Oscar Diaz"),
-        findChefId("Jassi Bindra"),
-        findChefId("Brittany Coch"),
-        findChefId("Jennifer Lee"),
-        findChefId("Justin Tootla"),
-        findChefId("Nana Arab"),
-      ].filter(id => id !== null) as string[];
-
-      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
-      const finalPicks = [...picks, ...remainingIds];
-
-      await updateDoc(doc(db, 'players', lori.id), { rankings: finalPicks });
-      showStatus('success', "Applied Lori's picks successfully!");
-    } catch (e: any) {
-      console.error(e);
-      showStatus('error', "Failed to apply picks: " + e.message);
-    } finally {
-      setIsAdminSubmitting(false);
-    }
-  };
-
-  const applyTravisPicks = async () => {
-    setIsAdminSubmitting(true);
-    try {
-      const travis = players.find(p => p.name.toLowerCase().includes('travis'));
-      if (!travis) {
-        showStatus('error', "Could not find a player named Travis.");
-        return;
-      }
-      const findChefId = (namePart: string) => {
-        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
-        return chef ? chef.id : null;
-      };
-
-      const picks = [
-        findChefId("Rhoda"),
-        findChefId("Brandon"),
-        findChefId("Jonathan"),
-        findChefId("Anthony"),
-        findChefId("Duyen"),
-        findChefId("Oscar"),
-        findChefId("Sherry"),
-        findChefId("Sieger"),
-        findChefId("Laurence"),
-        findChefId("Jassi"),
-        findChefId("Justin"),
-        findChefId("Jennifer"),
-        findChefId("Brittany"),
-        findChefId("Nana"),
-      ].filter(id => id !== null) as string[];
-
-      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
-      const finalPicks = [...picks, ...remainingIds];
-
-      await updateDoc(doc(db, 'players', travis.id), { rankings: finalPicks });
-      showStatus('success', "Applied Travis's picks successfully!");
-    } catch (e: any) {
-      console.error(e);
-      showStatus('error', "Failed to apply picks: " + e.message);
-    } finally {
-      setIsAdminSubmitting(false);
-    }
-  };
-
-  const applyAnnaPicks = async () => {
-    setIsAdminSubmitting(true);
-    try {
-      const anna = players.find(p => p.name.toLowerCase().includes('anna'));
-      if (!anna) {
-        showStatus('error', "Could not find a player named Anna.");
-        return;
-      }
-      const findChefId = (namePart: string) => {
-        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
-        return chef ? chef.id : null;
-      };
-
-      const picks = [
-        findChefId("Rhoda"),
-        findChefId("Anthony"),
-        findChefId("Duyen"),
-        findChefId("Sherry"),
-        findChefId("Oscar"),
-        findChefId("Jonathan"),
-        findChefId("Laurence"),
-        findChefId("Nana"),
-        findChefId("Sieger"),
-        findChefId("Jassi"),
-        findChefId("Brittany"),
-        findChefId("Brandon"),
-        findChefId("Jennifer"),
-        findChefId("Justin")
-      ].filter(id => id !== null) as string[];
-
-      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
-      const finalPicks = [...picks, ...remainingIds];
-
-      await updateDoc(doc(db, 'players', anna.id), { rankings: finalPicks });
-      showStatus('success', "Applied Anna's picks successfully!");
-    } catch (e: any) {
-      console.error(e);
-      showStatus('error', "Failed to apply picks: " + e.message);
-    } finally {
-      setIsAdminSubmitting(false);
-    }
-  };
-
-  const applyGarrettPicks = async () => {
-    setIsAdminSubmitting(true);
-    try {
-      const garrett = players.find(p => p.name.toLowerCase().includes('garrett'));
-      if (!garrett) {
-        showStatus('error', "Could not find a player named Garrett.");
-        return;
-      }
-      const findChefId = (namePart: string) => {
-        const chef = chefs.find(c => c.name.toLowerCase().includes(namePart.toLowerCase()));
-        return chef ? chef.id : null;
-      };
-
-      // Since he only knows Duyen and Brittany were his top picks, put them first.
-      const picks = [
-        findChefId("Duyen Ha"),
-        findChefId("Brittany Coch"),
-      ].filter(id => id !== null) as string[];
-
-      const remainingIds = chefs.map(c => c.id).filter(id => !picks.includes(id));
-      const finalPicks = [...picks, ...remainingIds];
-
-      await updateDoc(doc(db, 'players', garrett.id), { rankings: finalPicks });
-      showStatus('success', "Applied Garrett's partial picks successfully!");
-    } catch (e: any) {
-      console.error(e);
-      showStatus('error', "Failed to apply picks: " + e.message);
-    } finally {
-      setIsAdminSubmitting(false);
-    }
-  };
-
   const recoverDraftOrder = async () => {
     setIsAdminSubmitting(true);
     try {
@@ -5404,56 +5141,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
         </div>
         <p className="text-xs text-red-800 mb-4 font-medium uppercase tracking-tight">One-time tools to recover lost data.</p>
         <div className="flex flex-wrap gap-3">
-          <button 
-            onClick={applyChelseaPicks}
-            disabled={isAdminSubmitting}
-            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
-          >
-            Recover Chelsea's Draft Rankings
-          </button>
-          <button 
-            onClick={applyChrisPicks}
-            disabled={isAdminSubmitting}
-            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
-          >
-            Recover Chris's Draft Rankings
-          </button>
-          <button 
-            onClick={applyShanePicks}
-            disabled={isAdminSubmitting}
-            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
-          >
-            Recover Shane's Draft Rankings
-          </button>
-          <button 
-            onClick={applyLoriPicks}
-            disabled={isAdminSubmitting}
-            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
-          >
-            Recover Lori's Draft Rankings
-          </button>
-          <button 
-            onClick={applyTravisPicks}
-            disabled={isAdminSubmitting}
-            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
-          >
-            Recover Travis's Draft Rankings
-          </button>
-          <button 
-            onClick={applyAnnaPicks}
-            disabled={isAdminSubmitting}
-            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
-          >
-            Recover Anna's Draft Rankings
-          </button>
-          <button 
-            onClick={applyGarrettPicks}
-            disabled={isAdminSubmitting}
-            className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"
-          >
-            Recover Garrett's Draft Rankings
-          </button>
-          <button 
+          <button
             onClick={recoverDraftOrder}
             disabled={isAdminSubmitting}
             className="bg-red-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-700 transition-colors disabled:opacity-50"

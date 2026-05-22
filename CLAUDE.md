@@ -158,6 +158,16 @@ These are sharp edges I (Claude, 2026-05-21 session) am aware of. Update or remo
 - `handleAddScore` resets `chef.status` to `'active'` on any non-`Eliminated` event. So adding a "Top" event for a previously eliminated chef will bring them back to life. Bug. Don't add retroactive events for eliminated chefs unless you also fix status afterward.
 - Magic sync (`applyScrapedResults`, around line 3370+) updates `chef.status` based on parsed wiki data without ordering guarantees — re-running for an earlier week after a later week was already applied can flip status incorrectly.
 - `clearAllScores` is wired to a button. Two-click confirm exists. Don't touch.
+- **`handleMergePlayers`** does not validate that the two players don't already own the same chef. If they somehow do (shouldn't happen via the draft flow, but possible via admin manipulation), the merge will silently keep the duplicate in `chefIds`. Add an overlap check before merging if you ever touch this.
+- **`RankingView`** saves the player's `rankings` array without filtering out chef IDs that no longer exist in the `chefs` collection. If a chef is renamed/deleted while a player has the ranking page open, their saved rankings can contain ghost IDs. They render as blank/skip and silently lower the player's accuracy. Filter `rankings.filter(id => chefs.some(c => c.id === id))` on save.
+- **Magic sync (`ScraperTool`)** silently writes a malformed chef name if a Wikipedia editor makes a templating typo. Always click Parse & Preview first; eyeball the parsed names; only then Apply.
+- **`handleAutoDraft` / `handleFullAutoDraft`** fall back to "first available chef" if a player has no `rankings` set. Nondeterministic feel; not a bug. If you re-seed the league for next season, make sure every player has rankings before running auto-draft.
+- **`config.season.maxWeek`** is not validated against `max(scoreEvents.week)`. The "Through Week N" header can drift if you ever set `maxWeek` manually. Reconcile by hand if it looks wrong.
+- **Invite code check** in `handleJoinLeague` is case-sensitive. Trivial to live with; trivial to fix (`code.toLowerCase() === config.inviteCode.toLowerCase()`).
+- **`ProfileModal`** image upload uses a heuristic (~800KB cap). Possible "image too big" error post-edit instead of pre-edit. Minor UX.
+- **`AccuracyItem` and `CompactAccuracyItem`** duplicate the same ~120 lines of breakdown math. Extract a shared helper if you ever change the accuracy logic.
+- **`DraftView`** doesn't visually highlight the current picker in the draft-order list, only in the available-chefs section. Players have to count manually.
+- **`ProgressTable`** doesn't show Episode Sweep Bonus as its own cell label (the cell still says "WIN" for the elim win). The +3 IS included in the cell's points total and the hover tooltip. Cosmetic only.
 - The non-default Firestore database ID (`ai-studio-06434889-9c52-465f-a4aa-ccd676c98dcd`) is **easy to forget**. The web SDK in `src/firebase.ts` reads it from `firebase-applet-config.json`. Any new tooling must do the same — `getFirestore(app, dbId)`, never plain `getFirestore(app)`.
 - The Vite build emits a single ~1MB chunk. That's a known warning, not a bug. Don't chase code-splitting unless Garrett asks.
 
