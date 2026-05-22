@@ -4695,13 +4695,20 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
           points: e.points,
         }));
 
+      // A chef's "active" status is only suspect if their LATEST event was an
+      // Eliminated. Chefs who got Eliminated mid-season but then came back
+      // (via Last Chance Kitchen, medical reinstatement, etc.) will have later
+      // events that prove they returned — those are legit "active".
       const statusByChef = new Map(chefs.map(c => [c.id, c.status]));
       const statusIssues: { chefName: string; issue: string }[] = [];
-      for (const e of events) {
-        if (e.type === 'Eliminated' && statusByChef.get(e.chefId) === 'active') {
+      for (const c of chefs) {
+        if (statusByChef.get(c.id) !== 'active') continue;
+        const chefEvents = events.filter(e => e.chefId === c.id).sort((a, b) => b.week - a.week);
+        const latest = chefEvents[0];
+        if (latest?.type === 'Eliminated') {
           statusIssues.push({
-            chefName: chefs.find(c => c.id === e.chefId)?.name ?? '(unknown)',
-            issue: `Has Eliminated event (W${e.week}) but status is "active"`,
+            chefName: c.name,
+            issue: `Latest event is Eliminated (W${latest.week}) but status is "active"`,
           });
         }
       }

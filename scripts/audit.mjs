@@ -152,15 +152,20 @@ for (const p of players) {
 }
 
 // --- Chef status sanity ---
+// Only flag if the chef's LATEST event is Eliminated AND status is active.
+// Chefs who returned (LCK, reinstatement) have later events and are fine.
 const statusByChef = new Map(chefs.map((c) => [c.id, c.status]));
 const statusIssues = [];
-for (const ev of scoreEvents) {
-  if (ev.type === 'Eliminated' && statusByChef.get(ev.chefId) === 'active') {
+for (const c of chefs) {
+  if (statusByChef.get(c.id) !== 'active') continue;
+  const chefEvents = scoreEvents.filter((ev) => ev.chefId === c.id).sort((a, b) => b.week - a.week);
+  const latest = chefEvents[0];
+  if (latest?.type === 'Eliminated') {
     statusIssues.push({
-      chefId: ev.chefId,
-      chefName: chefs.find((c) => c.id === ev.chefId)?.name,
-      week: ev.week,
-      issue: 'Has Eliminated event but chef.status is "active"',
+      chefId: c.id,
+      chefName: c.name,
+      week: latest.week,
+      issue: `Latest event is Eliminated (W${latest.week}) but status is "active"`,
     });
   }
 }
