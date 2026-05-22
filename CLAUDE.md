@@ -99,17 +99,6 @@ The entire React app lives in **one file**: `src/App.tsx` (5,651 lines). **Do no
 | `Winning Top Chef` | +30 | Chef wins the season |
 | `Eliminated` | −2 | "OUT" in wiki table. Also covers `MED` (medical removal) by Garrett's call. |
 
-### Ranking-accuracy bonus (`calculatePlayerAccuracy` in `App.tsx`)
-
-The bonus rewards pre-draft prediction skill. As of 2026-05-22 the contract is:
-
-1. **Field excluded of owned chefs.** Each player's RMSE is computed over the chefs they did NOT draft. Drafting good chefs already pays out via chef performance; the bonus is for predicting the rest of the field. This prevents the double-dip where a player who drafted a top chef and ranked them #1 got paid twice for the same insight.
-2. **Absolute, not normalized.** `rawAccuracy = exp(-RMSE² / (2σ²))` with σ=3. Each player's bonus depends only on their own predictions, not on how well the best predictor in the league did.
-3. **Cap at +20.** Bonus = `round(rawAccuracy × 20)`. Smaller than `Winning Top Chef` (30) so it can never dominate the chef-performance signal. Tunable via the `BONUS_MAX` constant if a future league wants more or less weight on predictions.
-4. **`config.bonusScoresDisabled`** can turn the whole thing off.
-
-When changing the constants (σ or BONUS_MAX), preview the impact against current data before deploying — `scripts/audit.mjs` doesn't model the bonus, but a small `node -e` script can.
-
 ### Status semantics
 - `active`: still competing on the main show.
 - `lck`: was eliminated, is currently competing in Last Chance Kitchen.

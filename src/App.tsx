@@ -492,52 +492,52 @@ export function calculatePlayerAccuracy(players: Player[], chefs: Chef[], config
   });
   const actualChefOrder = sortedChefs.map(c => c.id);
 
-  // Fair-bonus scoring parameters (changed 2026-05-22 to balance snake draft):
-  //   * Exclude each player's owned chefs from their RMSE — drafting and
-  //     predicting are separate skills; don't double-pay players who did both.
-  //   * Absolute (not normalized) accuracy — one player's score shouldn't
-  //     depend on how well their opponents predicted.
-  //   * Cap at BONUS_MAX (20) so the bonus stays smaller than "Winning Top Chef"
-  //     and doesn't dominate actual chef performance.
-  //   * sigma 3 (slightly tighter falloff than the old 4).
-  const SIGMA = 3;
-  const BONUS_MAX = 20;
-
+  // Assess RMSE for each player
   const playerAccuracies = players.map(player => {
     if (!player.rankings || player.rankings.length === 0) {
       return { id: player.id, rawAccuracy: 0, avgDiff: 0 };
     }
-
-    const ownedIds = new Set(player.chefIds || []);
-    // Score predictions only against chefs the player does NOT own.
-    const fieldOrder = actualChefOrder.filter(id => !ownedIds.has(id));
+    
+    // Fill in any missing chefs at the bottom. 
+    // IMPORTANT: Sort missing chefs alphabetically so they don't accidentally match the actualChefOrder and give free accuracy points.
     const uniqueRankings = [...new Set(player.rankings || [])] as string[];
-    let playerValidRankings = uniqueRankings.filter(id => fieldOrder.includes(id));
-    // Missing chefs go to the bottom, alphabetized to prevent accidental matches.
-    const missingChefs = fieldOrder.filter(id => !playerValidRankings.includes(id)).sort((a, b) => a.localeCompare(b));
+    let playerValidRankings = uniqueRankings.filter(id => actualChefOrder.includes(id));
+    const missingChefs = actualChefOrder.filter(id => !playerValidRankings.includes(id)).sort((a, b) => a.localeCompare(b));
     playerValidRankings = playerValidRankings.concat(missingChefs);
-
+    
     let squaredDistance = 0;
     playerValidRankings.forEach((chefId, index) => {
-      const actualIndex = fieldOrder.indexOf(chefId);
-      if (actualIndex !== -1) squaredDistance += Math.pow(index - actualIndex, 2);
+      const actualIndex = actualChefOrder.indexOf(chefId);
+      if (actualIndex !== -1) {
+        squaredDistance += Math.pow(index - actualIndex, 2);
+      }
     });
 
-    const n = fieldOrder.length;
+    const n = actualChefOrder.length;
+    // Bell Curve Scoring Parameters
+    // A sigma of 4 gives a smooth, rewarding curve without punishing minor swaps too harshly
+    const sigma = 4; 
     const avgDiff = n > 0 ? Math.sqrt(squaredDistance / n) : 0; // RMSE
-    const rawAccuracy = n > 0 ? Math.exp(-(avgDiff * avgDiff) / (2 * SIGMA * SIGMA)) : 0;
-
+    
+    // Calculate raw accuracy
+    const rawAccuracy = n > 0 ? Math.exp(-(avgDiff * avgDiff) / (2 * sigma * sigma)) : 0;
+    
     return { id: player.id, rawAccuracy, avgDiff };
   });
+
+  const maxChefScore = Math.max(...chefs.map(c => c.totalScore), 0);
+  const validAccuracies = playerAccuracies.filter(p => (players.find(pl => pl.id === p.id)?.rankings?.length || 0) > 0);
+  const topRawAccuracy = validAccuracies.length > 0 ? Math.max(...validAccuracies.map(p => p.rawAccuracy)) : 0;
 
   let playersWithBonus = players.map(player => {
     const accInfo = playerAccuracies.find(a => a.id === player.id);
     const rawAcc = accInfo?.rawAccuracy || 0;
     const avgDiff = accInfo?.avgDiff || 0;
-
+    
+    // Normalize to top player
     const hasRankings = player.rankings && player.rankings.length > 0;
-    const acc = hasRankings ? rawAcc : 0;
-    const originalRankingBonus = Math.round(BONUS_MAX * acc);
+    const acc = topRawAccuracy > 0 && hasRankings ? (rawAcc / topRawAccuracy) : 0;
+    const originalRankingBonus = Math.round(maxChefScore * acc);
     const rankingBonus = config?.bonusScoresDisabled ? 0 : originalRankingBonus;
     const displayScore = player.totalScore + rankingBonus;
 
