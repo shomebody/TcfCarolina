@@ -2114,10 +2114,12 @@ function ScoreboardView({ players, chefs, config, events, user, comments, onJoin
                             <span className="uppercase tracking-wider">Chefs</span>
                             <span className="text-stone-900">{player.totalScore}</span>
                           </div>
-                          <div className="flex items-center gap-2 text-[10px] font-bold text-orange-600">
-                            <span className="uppercase tracking-wider">Bonus</span>
-                            <span>+{player.rankingBonus}</span>
-                          </div>
+                          {player.rankingBonus > 0 && (
+                            <div className="flex items-center gap-2 text-[10px] font-bold text-orange-600">
+                              <span className="uppercase tracking-wider">Bonus</span>
+                              <span>+{player.rankingBonus}</span>
+                            </div>
+                          )}
                         </div>
                         <div className="text-2xl font-black text-stone-900 tracking-tighter leading-none border-t border-stone-100 pt-1.5">
                           {player.displayScore}
@@ -2293,10 +2295,12 @@ function AccuracyItem({ player, index, actualChefOrder, chefs }: { player: any, 
             </div>
           </div>
         </div>
-        <div className="text-right">
-          <div className="font-black text-orange-600 text-lg tracking-tighter">+{player.rankingBonus}</div>
-          <div className="text-[8px] font-bold uppercase text-stone-400">Bonus Points</div>
-        </div>
+        {player.rankingBonus > 0 && (
+          <div className="text-right">
+            <div className="font-black text-orange-600 text-lg tracking-tighter">+{player.rankingBonus}</div>
+            <div className="text-[8px] font-bold uppercase text-stone-400">Bonus Points</div>
+          </div>
+        )}
       </div>
 
       <AnimatePresence>
@@ -2390,7 +2394,7 @@ function CompactAccuracyItem({ player, index, isMe, actualChefOrder, chefs }: { 
             <span className="text-xs font-black text-stone-500">#{index + 1}</span>
             <span className="font-bold text-sm">{player.displayName || player.name}</span>
           </div>
-          <span className="text-orange-500 font-black text-sm">+{player.rankingBonus} pts</span>
+          {player.rankingBonus > 0 && <span className="text-orange-500 font-black text-sm">+{player.rankingBonus} pts</span>}
         </div>
         <div className="w-full bg-white/10 h-1.5 rounded-full overflow-hidden">
           <div 
@@ -4958,6 +4962,13 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
     await updateDoc(configRef, { rankingsOpen: !config.rankingsOpen });
   };
 
+  const toggleBonus = async () => {
+    if (!config) return;
+    await updateDoc(doc(db, 'config', 'league'), {
+      bonusScoresDisabled: !config.bonusScoresDisabled,
+    });
+  };
+
   const randomizeDraftOrder = async () => {
     if (!config || config.draftStarted || isLocked) return;
     setIsAdminSubmitting(true);
@@ -5347,17 +5358,31 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
             <div className="text-[10px] font-normal text-stone-400">Resets points to zero but keeps season</div>
           </button>
 
-          <button 
+          <button
             onClick={toggleRankings}
             className={`flex flex-col items-center justify-center gap-2 p-6 rounded-2xl font-bold transition-all border text-center ${
-              config?.rankingsOpen 
-                ? 'bg-orange-50 border-orange-200 text-orange-600 hover:bg-orange-100' 
+              config?.rankingsOpen
+                ? 'bg-orange-50 border-orange-200 text-orange-600 hover:bg-orange-100'
                 : 'bg-stone-50 border-stone-200 text-stone-400 hover:bg-stone-100'
             }`}
           >
             <ListOrdered className="w-6 h-6 mb-1" />
             <div className="text-stone-900">{config?.rankingsOpen ? 'Close Rankings' : 'Open Rankings'}</div>
             <div className="text-[10px] font-normal text-stone-400">{config?.rankingsOpen ? 'Rankings are currently COLLECTING' : 'Rankings are currently CLOSED'}</div>
+          </button>
+
+          <button
+            onClick={toggleBonus}
+            disabled={isLocked}
+            className={`flex flex-col items-center justify-center gap-2 p-6 rounded-2xl font-bold transition-all border text-center disabled:opacity-50 ${
+              config?.bonusScoresDisabled
+                ? 'bg-stone-50 border-stone-200 text-stone-400 hover:bg-stone-100'
+                : 'bg-orange-50 border-orange-200 text-orange-600 hover:bg-orange-100'
+            }`}
+          >
+            <Target className="w-6 h-6 mb-1" />
+            <div className="text-stone-900">{config?.bonusScoresDisabled ? 'Enable Bonus Points' : 'Disable Bonus Points'}</div>
+            <div className="text-[10px] font-normal text-stone-400">{config?.bonusScoresDisabled ? 'Accuracy bonus is HIDDEN from leaderboard' : 'Accuracy bonus is SHOWING on leaderboard'}</div>
           </button>
 
           <div className="flex flex-col gap-2">
