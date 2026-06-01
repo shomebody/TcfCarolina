@@ -23,11 +23,15 @@ A private fantasy-Top-Chef league site for ~7 personal friends. **Not a product.
 
 ## 3. Workflow — single source of truth
 
-**Always:** edit local → commit → `git push origin main` → Firebase Hosting auto-redeploys from GitHub.
+**Always:** edit local → `npm run lint` → `npm run build` → commit → `git push origin main` → **`firebase deploy --only hosting --project tcf-22`**.
+
+> **2026-05-31 correction:** There is **no GitHub-triggered auto-deploy** for this repo, despite the previous version of this file claiming one. There is no `.github/workflows/` directory and Firebase Hosting does not pull from GitHub on its own. Pushing to `main` is necessary for the source of truth, but it does **not** update the live site. You must run `firebase deploy --only hosting` to actually publish. Confirmed by checking `last-modified` on the live `index.html` against the most recent commit — they drifted by 9 days.
 
 **Never:**
 - Use Google AI Studio. It was previously the editing path and produced months of divergence between local and GitHub. AI Studio is retired as of 2026-05-21.
-- Skip the local commit step. The deploy is GitHub-driven.
+- Skip the local commit + push step. The repo is the source of truth even though the deploy isn't wired to it.
+- Skip the `firebase deploy` step thinking the push will publish — it won't.
+- `firebase deploy` without `--only hosting`. A bare `firebase deploy` would push `firestore.rules` too, which is usually fine but unnecessary; pin the surface explicitly to avoid surprises.
 - Bypass `firestore.rules`. They protect Garrett from accidentally letting the world write to his DB.
 - Run `Clear All Scores` (line ~4768 in `src/App.tsx`). It exists as an emergency nuke; assume nobody ever wants that fired again. Never run it without explicit, repeated confirmation from Garrett.
 
