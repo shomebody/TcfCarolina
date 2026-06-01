@@ -3268,8 +3268,8 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
 
       setStatusMessage(`Fetching page: ${decodedTitle || url}...`);
       console.log('Fetching from API:', apiUrl);
-      const response = await fetch(`/api/proxy?url=${encodeURIComponent(apiUrl)}`);
-      if (!response.ok) throw new Error(`Failed to fetch from proxy (Status: ${response.status})`);
+      const response = await proxyFetch(apiUrl);
+      if (!response.ok) throw new Error(`Failed to fetch from Wikipedia (Status: ${response.status})`);
       
       let data = await response.json();
       console.log('API Response:', data);
@@ -3295,7 +3295,7 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
             console.log(`Searching for: "${term}"`);
             const searchUrl = `${domain}${apiPath}?action=query&list=search&srsearch=${encodeURIComponent(term)}&format=json&origin=*`;
             try {
-              const searchResponse = await fetch(`/api/proxy?url=${encodeURIComponent(searchUrl)}`);
+              const searchResponse = await proxyFetch(searchUrl);
               if (!searchResponse.ok) continue;
               const searchData = await searchResponse.json();
               
@@ -3321,7 +3321,7 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
             setStatusMessage(`Found match: "${searchMatch}". Fetching wikitext...`);
             console.log(`Found search match: "${searchMatch}". Fetching wikitext...`);
             const retryUrl = `${domain}${apiPath}?action=query&prop=revisions&rvprop=content&rvslots=main&titles=${encodeURIComponent(searchMatch)}&format=json&origin=*&redirects=1`;
-            const retryResponse = await fetch(`/api/proxy?url=${encodeURIComponent(retryUrl)}`);
+            const retryResponse = await proxyFetch(retryUrl);
             data = await retryResponse.json();
             pageId = Object.keys(data.query.pages)[0];
             page = data.query.pages[pageId];
@@ -3968,6 +3968,29 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
     setIsParsing(false);
   };
 
+  // Fetch a Wikipedia/Wikimedia API URL. Tries direct fetch first (works in
+  // production — the MediaWiki API supports CORS when the URL includes
+  // `origin=*`, which all of our API URLs do). Falls back to the local
+  // `/api/proxy` Express endpoint when running `npm run dev`. On Firebase
+  // Hosting that endpoint doesn't exist and gets rewritten to the SPA's
+  // index.html, which used to cause `Unexpected token '<' ... <!doctype ...
+  // is not valid JSON` — we detect that and throw a clear error instead.
+  const proxyFetch = async (targetUrl: string): Promise<Response> => {
+    try {
+      const direct = await fetch(targetUrl);
+      if (direct.ok) return direct;
+      console.warn(`Direct fetch returned ${direct.status}; trying /api/proxy fallback`);
+    } catch (e) {
+      console.warn('Direct fetch threw; trying /api/proxy fallback:', e);
+    }
+    const proxied = await fetch(`/api/proxy?url=${encodeURIComponent(targetUrl)}`);
+    const ct = proxied.headers.get('content-type') || '';
+    if (ct.includes('text/html')) {
+      throw new Error('Wikipedia fetch failed and the local /api/proxy endpoint is unavailable (you are on the deployed site). Try again in a moment; if it keeps failing, run the app locally via `npm run dev`.');
+    }
+    return proxied;
+  };
+
   const fetchWikitextHelper = async (fetchUrl: string) => {
     console.log("fetchWikitextHelper called with:", fetchUrl);
     try {
@@ -3990,7 +4013,7 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
       const apiUrl = `${domain}${apiPath}?action=query&prop=revisions&rvprop=content&rvslots=main&titles=${encodeURIComponent(decodedTitle)}&format=json&origin=*&redirects=1`;
       console.log("Calling proxy for:", apiUrl);
       
-      const response = await fetch(`/api/proxy?url=${encodeURIComponent(apiUrl)}`);
+      const response = await proxyFetch(apiUrl);
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       const data = await response.json();
       
@@ -4095,6 +4118,13 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
         }
         addLog(`Found ${episodesToSync.length} new weeks to apply: ${episodesToSync.map(e => e.week).join(', ')}`);
       }
+
+      // Apply weeks in ascending order so chef.status ends on the latest
+      // week. The status field is overwritten per-week, and earlier weeks
+      // running after later ones would flip e.g. an eliminated chef back to
+      // "active". The points logic uses increment() and is order-independent.
+      episodesToSync = [...episodesToSync].sort((a, b) => a.week - b.week);
+      addLog(`Apply order (ascending): ${episodesToSync.map(e => e.week).join(', ')}`);
 
       addLog("Applying episode data to database via transactions...");
       let totalPoints = 0;
