@@ -3620,7 +3620,13 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
           });
         } 
         // --- Case 2: Last Chance Kitchen Table Rows (Winner & Loser) ---
-        else if (cells.length >= 3 && cells[0].match(/^\d+/) && (cells[2].toLowerCase().includes('win') || cells[2].toLowerCase().includes('return') || cells.some(c => c.toLowerCase().includes('win')))) {
+        // LCK table rows have a short shape (rank | contestants | winner [| notes]).
+        // The cells.length <= 6 guard prevents this branch from swallowing a
+        // contestant-progress row that happens to contain WIN somewhere — which
+        // would orphan that chef entirely (no weekMap entries → magic sync
+        // misses their later eliminations). The cell[2] check stays specific
+        // instead of the previous loose `cells.some(c => includes('win'))`.
+        else if (cells.length >= 3 && cells.length <= 6 && cells[0].match(/^\d+/) && (cells[2].toLowerCase().includes('win') || cells[2].toLowerCase().includes('return'))) {
           const weekPart = cells[0].match(/(\d+)/)?.[1];
           const week = weekPart ? parseInt(weekPart) : 0;
           
@@ -3750,13 +3756,16 @@ function ScraperTool({ chefs, players, config, showStatus }: { chefs: Chef[], pl
                                cellUpper.includes('COLOR:GREEN') || cellUpper.includes('BACKGROUND:GREEN');
 
               if (isRealResult) {
-                if (upperCell.includes('WINNER')) { type = 'Winner'; points = 30; }
-                else if (upperCell.includes('RUNNER-UP')) { type = 'Runner-Up'; points = 15; }
+                // Type strings must exactly match a SCORING_RULES.type entry.
+                // Drift here (e.g. "Top" vs "Judges Table Top") breaks downstream
+                // duplicate-detection, the audit, and the admin tools.
+                if (upperCell.includes('WINNER')) { type = 'Winning Top Chef'; points = 30; }
+                else if (upperCell.includes('RUNNER-UP')) { type = 'Making Season Finale'; points = 15; }
                 else if (upperCell.includes('LCK WIN') || upperCell.includes('LAST CHANCE KITCHEN WIN')) { type = 'Last Chance Kitchen Win'; points = 2; inLCK = true; }
                 else if (isReturn) { type = 'Returned from LCK'; points = 2; inLCK = true; eliminated = false; }
                 else if (isWin) { type = 'Elimination Win'; points = 7; }
-                else if (isHigh) { type = 'Top'; points = 4; }
-                else if (isLow) { type = 'Bottom'; points = -2; }
+                else if (isHigh) { type = 'Judges Table Top'; points = 4; }
+                else if (isLow) { type = 'Judges Table Bottom'; points = -2; }
                 else if (upperCell.includes('MED')) { type = 'Medically Removed'; points = 0; eliminated = true; }
                 else if (isOut) { type = 'Eliminated'; points = -2; eliminated = true; }
                 else if (isSafe) { type = 'Safe'; points = 0; }
@@ -4805,7 +4814,7 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
     { chefName: 'Rhoda Magbitang', week: 8, type: 'Last Chance Kitchen Win', note: 'LCK Ep 5 vs Brandon (returned W9)' },
   ];
   const SEASON_22_STATUS_FIXES: { chefName: string; status: 'active' | 'eliminated' | 'lck' }[] = [
-    { chefName: 'Sieger Bayer', status: 'active' },
+    { chefName: 'Sieger Bayer', status: 'eliminated' }, // out W12
     { chefName: 'Rhoda Magbitang', status: 'active' },
     { chefName: 'Anthony Jones', status: 'eliminated' },
     { chefName: 'Duyen Ha', status: 'eliminated' },
