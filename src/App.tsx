@@ -606,9 +606,29 @@ export default function App() {
   const chefs = useMemo(() => {
     const startWeek = config?.scoringStartWeek ?? 1;
     return rawChefs.map(chef => {
-      const chefEvents = events.filter(e => e.chefId === chef.id && e.week >= startWeek);
-      const computedScore = chefEvents.reduce((sum, e) => sum + (e.points || 0), 0);
-      return { ...chef, totalScore: computedScore };
+      const scoringEvents = events.filter(e => e.chefId === chef.id && e.week >= startWeek);
+      const computedScore = scoringEvents.reduce((sum, e) => sum + (e.points || 0), 0);
+
+      // Derive status from the chef's most recent week of events. chef.status
+      // in Firestore is a cache that's repeatedly been wrong (magic sync used
+      // to overwrite it from a buggy parser); scoreEvents is canonical, so
+      // re-derive here. Once the right events exist, the leaderboard is
+      // self-correcting and no future sync can flip it back.
+      const allChefEvents = events.filter(e => e.chefId === chef.id);
+      let derivedStatus: 'active' | 'eliminated' | 'lck' = chef.status || 'active';
+      if (allChefEvents.length > 0) {
+        const maxWeek = Math.max(...allChefEvents.map(e => e.week));
+        const lastWeekTypes = allChefEvents.filter(e => e.week === maxWeek).map(e => e.type);
+        if (lastWeekTypes.some(t => t === 'Eliminated' || t === 'Eliminated from LCK')) {
+          derivedStatus = 'eliminated';
+        } else if (lastWeekTypes.some(t => t === 'Last Chance Kitchen Win')) {
+          derivedStatus = 'lck';
+        } else {
+          derivedStatus = 'active';
+        }
+      }
+
+      return { ...chef, totalScore: computedScore, status: derivedStatus };
     });
   }, [rawChefs, events, config?.scoringStartWeek]);
 
