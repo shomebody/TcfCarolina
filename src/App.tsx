@@ -4747,13 +4747,19 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
       const known = new Set(SCORING_RULES.map(r => r.type));
       const startWeek = config?.scoringStartWeek ?? 1;
 
-      // Drift compares stored chef.totalScore against the sum of events from
-      // scoringStartWeek onward — earlier weeks are intentionally excluded.
+      // Drift compares the STORED chef.totalScore in Firestore (the cache)
+      // against the sum of events. The `chefs` prop here is the derived
+      // useMemo value — comparing against that would always read 0 drift
+      // because both sides would be recomputed from events. We need the raw
+      // Firestore cache to find actual drift.
+      const chefsSnap = await getDocs(collection(db, 'chefs'));
+      const rawChefDocs = chefsSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+
       const sums = new Map<string, number>();
       for (const e of events) {
         if (e.week >= startWeek) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
       }
-      const drift = chefs
+      const drift = rawChefDocs
         .map(c => ({ name: c.name, stored: c.totalScore ?? 0, summed: sums.get(c.id) ?? 0 }))
         .filter(d => d.stored !== d.summed)
         .map(d => ({ ...d, delta: d.stored - d.summed }));
@@ -4938,8 +4944,16 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
         if (e.week >= startWeek) sums.set(e.chefId, (sums.get(e.chefId) || 0) + (e.points || 0));
       }
 
+      // Compare against the RAW Firestore cache, not the derived `chefs`/`players`
+      // props — those are recomputed from events already, so comparing would
+      // always find zero drift and the batch would never write the fix.
+      const rawChefsSnap = await getDocs(collection(db, 'chefs'));
+      const rawChefDocs = rawChefsSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+      const rawPlayersSnap = await getDocs(collection(db, 'players'));
+      const rawPlayerDocs = rawPlayersSnap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
+
       const chefBatch = writeBatch(db);
-      for (const c of chefs) {
+      for (const c of rawChefDocs) {
         const target = sums.get(c.id) ?? 0;
         const current = c.totalScore ?? 0;
         if (target !== current) {
@@ -4950,10 +4964,10 @@ function AdminView({ chefs, players, seedData, config, onAutoDraft, onFullAutoDr
       }
       if (chefsUpdated > 0) await chefBatch.commit();
 
-      // Re-derive player totals from the just-updated chef sums (use sums map, not stale cache).
+      // Re-derive player totals from the just-updated chef sums.
       const playerBatch = writeBatch(db);
-      for (const p of players) {
-        const target = (p.chefIds || []).reduce((s, cid) => s + (sums.get(cid) ?? 0), 0);
+      for (const p of rawPlayerDocs) {
+        const target = (p.chefIds || []).reduce((s: number, cid: string) => s + (sums.get(cid) ?? 0), 0);
         const current = p.totalScore ?? 0;
         if (target !== current) {
           playerBatch.update(doc(db, 'players', p.id), { totalScore: target });
